@@ -163,6 +163,7 @@ typedef struct {
 
 /* 表32, header part */
 typedef struct {
+    uint8_t nal_unit_type;                   /* which kind of patch NAL unit carried it */
     uint8_t patch_index;
     uint8_t fixed_patch_qp_flag, patch_qp;
     uint8_t patch_sao_enable_flag[3];
@@ -192,6 +193,10 @@ int svac3_next_nal(const uint8_t *buf, size_t len, size_t *pos,
 size_t svac3_unescape(const uint8_t *src, size_t src_len, uint8_t *dst);
 
 int svac3_parse_nal_header(const uint8_t *nal, size_t len, svac3_nal_header_t *h);
+
+/* 1 if nal_unit_type carries patch data (表55): types 1, 2, 4, 12, 14, 17,
+ * 18 and 19. */
+int svac3_nal_is_patch(unsigned nal_unit_type);
 
 /* Parse one NAL unit (without start code). When dump is not NULL, the fields
  * are written there as "key=value" lines in the format of

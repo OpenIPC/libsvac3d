@@ -25,10 +25,23 @@ target_link_libraries(svac3dump uavs3d)
 
 enable_testing()
 file(GLOB SVAC3_TEST_STREAMS ${CMAKE_SOURCE_DIR}/tests/streams/*.svac3)
+add_executable(svac3patch tools/svac3patch.c)
+target_include_directories(svac3patch PRIVATE source/svac3)
+target_link_libraries(svac3patch uavs3d)
+
 add_executable(test_hls tests/test_hls.c)
 target_include_directories(test_hls PRIVATE source/svac3)
 target_link_libraries(test_hls uavs3d)
 add_test(NAME test_hls
          COMMAND test_hls ${CMAKE_SOURCE_DIR}/tests/streams/cv608_synth_1080p_cbr2m.svac3)
+add_executable(test_patch tests/test_patch.c)
+target_include_directories(test_patch PRIVATE source/svac3)
+target_link_libraries(test_patch uavs3d)
+add_test(NAME test_patch
+         COMMAND test_patch ${CMAKE_SOURCE_DIR}/tests/streams/cv608_synth_1080p_cbr2m.svac3)
+foreach(stream ${SVAC3_TEST_STREAMS})
+    get_filename_component(name ${stream} NAME_WE)
+    add_test(NAME patch_parse_${name} COMMAND svac3patch ${stream})
+endforeach()
 add_test(NAME hls_dump
          COMMAND ${CMAKE_SOURCE_DIR}/tests/hls_dump.sh $<TARGET_FILE:svac3dump> ${SVAC3_TEST_STREAMS})

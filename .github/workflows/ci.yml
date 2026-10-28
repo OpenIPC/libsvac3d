@@ -37,12 +37,19 @@ jobs:
     runs-on: ubuntu-24.04
     steps:
       - uses: actions/checkout@v4
-      - name: Build fuzzer
+      - name: Build fuzzers
         run: |
-          clang -g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined \
-            -Isource/svac3 tests/fuzz/fuzz_hls.c source/svac3/svac3_hls.c -o fuzz_hls
-      - name: Fuzz for 60 s
+          F="-g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -Isource/svac3"
+          clang $F tests/fuzz/fuzz_hls.c source/svac3/svac3_hls.c -o fuzz_hls
+          clang $F tests/fuzz/fuzz_patch.c source/svac3/svac3_hls.c source/svac3/svac3_aec.c \
+            source/svac3/svac3_patch.c -o fuzz_patch
+      - name: Fuzz the header parser for 60 s
         run: |
           mkdir -p corpus
           cp tests/streams/*.svac3 corpus/
           ./fuzz_hls -max_total_time=60 -max_len=65536 corpus
+      - name: Fuzz the patch parser for 60 s
+        run: |
+          mkdir -p corpus_patch
+          head -c 60000 tests/streams/cv608_synth_1080p_cbr2m.svac3 > corpus_patch/idr.svac3
+          ./fuzz_patch -max_total_time=60 -max_len=65536 corpus_patch

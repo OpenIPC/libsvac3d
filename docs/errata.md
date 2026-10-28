@@ -10,3 +10,6 @@ Defects found in the SVAC 3.0 public-comment draft (national standard plan
 | 5.2.1.7.2 heading | carries the wrong table title (表21) | none (editorial) |
 | 表13 / `low_delay` semantics | `low_delay` is sent only for profiles 0x40/0x42; when absent it is 1, and Main (0x30) requires 1 | inferred as 1; reading it as 0 desynchronises the SPS tail by 5 bits |
 | 表31 `ref_pic_list_set_flag[1]` | absent when `rpl1_index_exist_flag` is 0 | inferred equal to `ref_pic_list_set_flag[0]` |
+| 5.3.3.3.3.5 `update_ctx` | when a probability passes 1023 it is reflected (2047 − p), but neither branch flips the MPS | the MPS flips; with MAEC it flips when **either** `lgPmps0` or `lgPmps1` reflects. Only this reading parses the corpus: with no flip, or a flip on `lgPmps0` alone, the first IDR picture desynchronises |
+| 表36 `block()`, SRCC branch | chroma blocks are scanned with the CU's luma `blockWidth`/`blockHeight`; only the run-level branch halves them | chroma blocks are half the CU size (4:2:0); the unhalved reading desynchronises the first IDR picture |
+| 5.3.3.3.3.2 `decode_decision` | the MAEC `lgPmps` expressions have unbalanced parentheses | `lgPmps = (lgPmps0 + lgPmps1 + 1) >> 3`; for `CtxWeight`, each side is `(lgPmps0 + lgPmps1 + 1) >> 1` |
