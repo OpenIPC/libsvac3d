@@ -76,7 +76,7 @@ jobs:
         run: |
           mkdir ffbuild && cd ffbuild
           PKG_CONFIG_PATH="$GITHUB_WORKSPACE/prefix/lib/pkgconfig" ../ffmpeg-src/configure \
-            --disable-everything --disable-doc --disable-network --disable-autodetect \
+            --disable-everything --disable-doc --disable-network --disable-autodetect --disable-x86asm \
             --enable-libsvac3d --enable-decoder=libsvac3d --enable-parser=svac3 \
             --enable-demuxer=svac3 --enable-protocol=file --enable-muxer=framemd5 --enable-encoder=rawvideo \
             --enable-filter=null,format --extra-cflags=-Werror=implicit-function-declaration

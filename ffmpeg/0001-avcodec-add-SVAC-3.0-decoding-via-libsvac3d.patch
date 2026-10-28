@@ -8,19 +8,19 @@ Adds AV_CODEC_ID_SVAC3, an access-unit parser, a raw demuxer (.svac,
 (https://github.com/OpenIPC/libsvac3d), which decodes the Main profile
 tool set of the GB/T SVAC 3.0 draft.
 ---
- configure                 |   5 ++
+ configure                 |   5 +
  libavcodec/Makefile       |   2 +
  libavcodec/allcodecs.c    |   1 +
  libavcodec/codec_desc.c   |   7 ++
  libavcodec/codec_id.h     |   1 +
- libavcodec/libsvac3d.c    | 165 ++++++++++++++++++++++++++++++++++++++
+ libavcodec/libsvac3d.c    | 203 ++++++++++++++++++++++++++++++++++++++
  libavcodec/parsers.c      |   1 +
- libavcodec/svac3.h        |  54 +++++++++++++
- libavcodec/svac3_parser.c | 118 +++++++++++++++++++++++++++
+ libavcodec/svac3.h        |  54 ++++++++++
+ libavcodec/svac3_parser.c | 118 ++++++++++++++++++++++
  libavformat/Makefile      |   1 +
  libavformat/allformats.c  |   1 +
- libavformat/svac3dec.c    |  64 +++++++++++++++
- 12 files changed, 420 insertions(+)
+ libavformat/svac3dec.c    |  64 ++++++++++++
+ 12 files changed, 458 insertions(+)
  create mode 100644 libavcodec/libsvac3d.c
  create mode 100644 libavcodec/svac3.h
  create mode 100644 libavcodec/svac3_parser.c
@@ -127,10 +127,10 @@ index 668a068..a089876 100644
      AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs
 diff --git a/libavcodec/libsvac3d.c b/libavcodec/libsvac3d.c
 new file mode 100644
-index 0000000..38aba10
+index 0000000..1e4060b
 --- /dev/null
 +++ b/libavcodec/libsvac3d.c
-@@ -0,0 +1,165 @@
+@@ -0,0 +1,203 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -156,6 +156,7 @@ index 0000000..38aba10
 +
 +#include <svac3d.h>
 +
++#include "libavutil/fifo.h"
 +#include "libavutil/imgutils.h"
 +#include "avcodec.h"
 +#include "codec_internal.h"
@@ -164,9 +165,10 @@ index 0000000..38aba10
 +typedef struct LibSVAC3DContext {
 +    svac3d_t *dec;
 +    AVCodecContext *avctx;
-+    AVFrame *frame;          ///< the frame the current packet decodes into
-+    int got_frame;
++    AVPacket *pkt;
++    AVFifo *frames;          ///< decoded pictures not yet returned, AVFrame *
 +    int err;                 ///< error raised inside the output callback
++    int pending_err;         ///< error to return once the queued pictures are out
 +} LibSVAC3DContext;
 +
 +static int svac3d_error(int err)
@@ -179,21 +181,18 @@ index 0000000..38aba10
 +    }
 +}
 +
++/* Called by svac3d_decode() for each picture: copy it into a frame of our
++ * own and queue it, since one packet may complete several pictures. */
 +static void svac3d_output(void *opaque, const svac3d_picture_t *pic)
 +{
 +    LibSVAC3DContext *s = opaque;
 +    AVCodecContext *avctx = s->avctx;
-+    AVFrame *frame = s->frame;
 +    svac3d_info_t info;
++    AVFrame *frame;
 +    int ret;
 +
 +    if (s->err)
 +        return;
-+    if (s->got_frame) {
-+        /* the parser hands over one access unit per packet */
-+        av_log(avctx, AV_LOG_WARNING, "More than one picture in a packet, dropping one\n");
-+        return;
-+    }
 +    if (pic->width != avctx->width || pic->height != avctx->height) {
 +        ret = ff_set_dimensions(avctx, pic->width, pic->height);
 +        if (ret < 0) {
@@ -204,8 +203,14 @@ index 0000000..38aba10
 +    if (!svac3d_get_info(s->dec, &info) && info.frame_rate_num)
 +        avctx->framerate = (AVRational){ info.frame_rate_num, info.frame_rate_den };
 +
++    frame = av_frame_alloc();
++    if (!frame) {
++        s->err = AVERROR(ENOMEM);
++        return;
++    }
 +    ret = ff_get_buffer(avctx, frame, 0);
 +    if (ret < 0) {
++        av_frame_free(&frame);
 +        s->err = ret;
 +        return;
 +    }
@@ -220,24 +225,41 @@ index 0000000..38aba10
 +        frame->flags |= AV_FRAME_FLAG_KEY;
 +    else
 +        frame->flags &= ~AV_FRAME_FLAG_KEY;
-+    s->got_frame = 1;
++    ret = av_fifo_write(s->frames, &frame, 1);
++    if (ret < 0) {
++        av_frame_free(&frame);
++        s->err = ret;
++    }
++}
++
++static void drop_frames(LibSVAC3DContext *s)
++{
++    AVFrame *frame;
++
++    while (s->frames && av_fifo_read(s->frames, &frame, 1) >= 0)
++        av_frame_free(&frame);
 +}
 +
 +static av_cold int libsvac3d_init(AVCodecContext *avctx)
 +{
 +    LibSVAC3DContext *s = avctx->priv_data;
 +
-+    s->avctx = avctx;
-+    s->dec   = svac3d_open();
-+    if (!s->dec)
++    s->avctx  = avctx;
++    s->pkt    = av_packet_alloc();
++    s->frames = av_fifo_alloc2(2, sizeof(AVFrame *), AV_FIFO_FLAG_AUTO_GROW);
++    s->dec    = svac3d_open();
++    if (!s->pkt || !s->frames || !s->dec)
 +        return AVERROR(ENOMEM);
 +    avctx->pix_fmt = AV_PIX_FMT_YUV420P;
 +
 +    /* parameter sets carried out of band */
 +    if (avctx->extradata_size > 0) {
 +        int ret = svac3d_decode(s->dec, avctx->extradata, avctx->extradata_size, NULL, NULL);
-+        if (ret < 0)
++        if (ret < 0) {
 +            av_log(avctx, AV_LOG_WARNING, "Could not decode extradata (%d)\n", ret);
++            if (avctx->err_recognition & AV_EF_EXPLODE)
++                return svac3d_error(ret);
++        }
 +    }
 +    return 0;
 +}
@@ -246,6 +268,9 @@ index 0000000..38aba10
 +{
 +    LibSVAC3DContext *s = avctx->priv_data;
 +
++    drop_frames(s);
++    av_fifo_freep2(&s->frames);
++    av_packet_free(&s->pkt);
 +    svac3d_close(s->dec);
 +    s->dec = NULL;
 +    return 0;
@@ -255,31 +280,44 @@ index 0000000..38aba10
 +{
 +    LibSVAC3DContext *s = avctx->priv_data;
 +
++    drop_frames(s);
++    s->pending_err = 0;
 +    svac3d_reset(s->dec);
 +}
 +
-+static int libsvac3d_decode(AVCodecContext *avctx, AVFrame *frame,
-+                            int *got_frame, AVPacket *avpkt)
++static int libsvac3d_receive_frame(AVCodecContext *avctx, AVFrame *frame)
 +{
 +    LibSVAC3DContext *s = avctx->priv_data;
++    AVFrame *out;
 +    int ret;
 +
-+    *got_frame   = 0;
-+    s->frame     = frame;
-+    s->got_frame = 0;
-+    s->err       = 0;
++    for (;;) {
++        if (av_fifo_read(s->frames, &out, 1) >= 0) {
++            av_frame_move_ref(frame, out);
++            av_frame_free(&out);
++            return 0;
++        }
++        if (s->pending_err) {
++            /* reported after the pictures the same packet did produce */
++            ret = s->pending_err;
++            s->pending_err = 0;
++            return ret;
++        }
 +
-+    ret = svac3d_decode(s->dec, avpkt->data, avpkt->size, svac3d_output, s);
-+    if (s->err < 0)
-+        return s->err;
-+    if (ret < 0) {
-+        av_log(avctx, AV_LOG_ERROR, "Decoding failed (%d)%s\n", ret,
-+               ret == SVAC3D_ERR_CORRUPT ? ": corrupt patch, or its reference is missing" : "");
-+        if (!s->got_frame)
-+            return svac3d_error(ret);
++        ret = ff_decode_get_packet(avctx, s->pkt);
++        if (ret < 0)
++            return ret;                     /* EAGAIN, or EOF: no pictures are held back */
++        s->err = 0;
++        ret = svac3d_decode(s->dec, s->pkt->data, s->pkt->size, svac3d_output, s);
++        av_packet_unref(s->pkt);
++        if (s->err < 0) {
++            s->pending_err = s->err;
++        } else if (ret < 0) {
++            av_log(avctx, AV_LOG_ERROR, "Decoding failed (%d)%s\n", ret,
++                   ret == SVAC3D_ERR_CORRUPT ? ": corrupt patch, or its reference is missing" : "");
++            s->pending_err = svac3d_error(ret);
++        }
 +    }
-+    *got_frame = s->got_frame;
-+    return avpkt->size;
 +}
 +
 +const FFCodec ff_libsvac3d_decoder = {
@@ -291,7 +329,7 @@ index 0000000..38aba10
 +    .init           = libsvac3d_init,
 +    .close          = libsvac3d_close,
 +    .flush          = libsvac3d_flush,
-+    FF_CODEC_DECODE_CB(libsvac3d_decode),
++    FF_CODEC_RECEIVE_FRAME_CB(libsvac3d_receive_frame),
 +    .p.capabilities = AV_CODEC_CAP_DR1,
 +    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
 +    .p.wrapper_name = "libsvac3d",

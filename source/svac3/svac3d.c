@@ -59,8 +59,8 @@ int svac3d_decode(svac3d_t *d, const uint8_t *buf, size_t len, svac3d_output_fn 
     size_t pos = 0, nal_len;
     const uint8_t *nal;
     while (svac3_next_nal(buf, len, &pos, &nal, &nal_len)) {
-        if (nal_len < 2)
-            continue;                        /* stray zero bytes or a broken header */
+        if (!nal_len)
+            continue;                        /* two start codes in a row */
         const svac3_frame_t *f;
         const int ret = svac3_dec_nal(d->dec, nal, nal_len, &f);
         if (ret)

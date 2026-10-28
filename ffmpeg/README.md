@@ -47,6 +47,10 @@ CI builds a minimal FFmpeg this way and runs the check on every change.
   security parameter set that follows a patch; key frames are pictures
   with an IDR or RAP-I patch.
 - Pictures come out in decoding order (low delay, no B pictures).
+- A packet may hold any whole number of NAL units and complete several
+  pictures (the parser makes it one); each picture is returned. When a
+  packet completes some pictures and then fails, the pictures are returned
+  first and the error after them.
 - A P picture whose reference was lost (decoding from the middle of a
   stream, or after a seek) is an `AVERROR_INVALIDDATA` until the next I
   picture.

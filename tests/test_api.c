@@ -127,6 +127,11 @@ int main(int argc, char **argv)
     svac3d_close(d);
 
     CHECK(svac3d_decode(NULL, buf, len, out, NULL) == SVAC3D_ERR_ARG);
+    /* a NAL unit too short for its header is an error, not skipped */
+    d = svac3d_open();
+    static const uint8_t short_nal[] = { 0, 0, 1, 0x40, 0, 0, 1 };
+    CHECK(svac3d_decode(d, short_nal, sizeof(short_nal), out, NULL) == SVAC3D_ERR_INVALID);
+    svac3d_close(d);
     CHECK(strcmp(svac3d_version(), "0.1.0") >= 0);
 
     free(buf);
