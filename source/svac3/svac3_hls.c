@@ -265,6 +265,10 @@ static int parse_sps(bits_t *b, svac3_sps_t *s, FILE *dump)
     F(s->vertical_size, "vertical_size", 14);
     F(s->pic_width_in_luma, "pic_width_in_luma", 14);
     F(s->pic_height_in_luma, "pic_height_in_luma", 14);
+    /* the display size lies within the coded size (5.2.2 semantics) */
+    if (!s->horizontal_size || !s->vertical_size ||
+        s->horizontal_size > s->pic_width_in_luma || s->vertical_size > s->pic_height_in_luma)
+        return b->err ? b->err : SVAC3_ERR_INVALID;
     if (s->reference_picture_resampling_enable_flag) {
         F(s->rpr_pic_width_in_luma, "rpr_pic_width_in_luma", 14);
         F(s->rpr_pic_height_in_luma, "rpr_pic_height_in_luma", 14);
