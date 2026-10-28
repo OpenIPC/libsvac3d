@@ -55,3 +55,36 @@ jobs:
           mkdir -p corpus_patch
           head -c 60000 tests/streams/cv608_synth_1080p_cbr2m.svac3 > corpus_patch/idr.svac3
           ./fuzz_patch -max_total_time=60 -max_len=65536 corpus_patch
+
+  ffmpeg:
+    runs-on: ubuntu-24.04
+    env:
+      FFMPEG_TAG: n9.0.2
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install libsvac3d into a prefix
+        run: |
+          cmake -S . -B build -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX="$PWD/prefix"
+          cmake --build build -j"$(nproc)"
+          cmake --install build
+      - name: Fetch FFmpeg and apply the patch
+        run: |
+          git clone -q --depth 1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
+          git -C ffmpeg-src apply --check "$GITHUB_WORKSPACE"/ffmpeg/0001-*.patch
+          git -C ffmpeg-src apply "$GITHUB_WORKSPACE"/ffmpeg/0001-*.patch
+      - name: Build a minimal FFmpeg with libsvac3d
+        run: |
+          mkdir ffbuild && cd ffbuild
+          PKG_CONFIG_PATH="$GITHUB_WORKSPACE/prefix/lib/pkgconfig" ../ffmpeg-src/configure \
+            --disable-everything --disable-doc --disable-network --disable-autodetect \
+            --enable-libsvac3d --enable-decoder=libsvac3d --enable-parser=svac3 \
+            --enable-demuxer=svac3 --enable-protocol=file --enable-muxer=framemd5 --enable-encoder=rawvideo \
+            --enable-filter=null,format --extra-cflags=-Werror=implicit-function-declaration
+          make -j"$(nproc)" ffmpeg
+      - name: framemd5 equals the golden hashes
+        run: |
+          for g in tests/golden/*.framemd5; do
+            s="tests/streams/$(basename "$g" .framemd5).svac3"
+            ffbuild/ffmpeg -hide_banner -loglevel warning -i "$s" -f framemd5 out.framemd5
+            python3 ffmpeg/check_framemd5.py "$g" out.framemd5
+          done

@@ -30,6 +30,7 @@ struct svac3_dec {
     int w, h;
     int64_t cycle;
     int doi_prev, have_prev;
+    int64_t last_poi;
 };
 
 svac3_dec_t *svac3_dec_create(void)
@@ -60,6 +61,11 @@ void svac3_dec_reset(svac3_dec_t *d)
     for (int i = 0; i < DPB_SLOTS; i++)
         d->pic[i].used = 0;
     d->have_prev = 0;
+}
+
+int64_t svac3_dec_poi(const svac3_dec_t *d)
+{
+    return d->last_poi;
 }
 
 const svac3_hls_t *svac3_dec_hls(const svac3_dec_t *d)
@@ -217,6 +223,7 @@ static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
     cur->used = 1;
     cur->doi = doi;
     cur->poi = poi;
+    d->last_poi = poi;
     *out = &cur->f;
     return SVAC3_OK;
 }
