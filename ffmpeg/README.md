@@ -45,7 +45,7 @@ CI builds a minimal FFmpeg this way and runs the check on every change.
   other codecs.
 - The parser cuts before an SPS, PPS, picture header, SEI, extension or
   security parameter set that follows a patch; key frames are pictures
-  with an IDR or RAP-I patch.
+  with an IDR or RAP-I patch, and displayed library pictures.
 - Pictures come out in decoding order (low delay, no B pictures).
 - A packet may hold any whole number of NAL units and complete several
   pictures (the parser makes it one); each picture is returned. When a

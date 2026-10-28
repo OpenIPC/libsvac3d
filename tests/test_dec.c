@@ -4,6 +4,7 @@
  * Unit tests for the SVAC3 picture decoder's buffer handling.
  * usage: test_dec <stream.svac3>   (a stream from tests/streams: SPS, PPS,
  *        an IDR picture, then P pictures each referencing the one before)
+ *        test_dec -library <stream.svac3>   (a stream with library pictures)
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -43,14 +44,65 @@ static int feed(svac3_dec_t *d, const unit_t *u, int from, int to, int *pics)
     return 0;
 }
 
+/* A stream with library pictures: all of it decodes, and an RL picture
+ * whose library picture was never decoded is refused. */
+static void library_checks(const unit_t *u, int n)
+{
+    int lib = -1, rl = -1, sps = -1, patches = 0;
+    for (int i = 0; i < n; i++) {
+        const unsigned t = u[i].p[1] & 31u;
+        patches += u[i].patch;
+        if (t == SVAC3_NAL_CRR_DP_PATCH && lib < 0)
+            lib = i;
+        if (t == SVAC3_NAL_RL_PATCH && rl < 0)
+            rl = i;
+        if (t == SVAC3_NAL_SPS && lib >= 0 && rl < 0)
+            sps = i;                         /* the display SPS after the library picture */
+    }
+    CHECK(lib >= 0 && rl > lib && sps > lib);
+    if (lib < 0 || rl < 0 || sps < 0)
+        return;
+
+    svac3_dec_t *d = svac3_dec_create();
+    int pics = 0, rising = 1;
+    int64_t poi = -1;
+    for (int i = 0; i < n; i++) {
+        const svac3_frame_t *f;
+        CHECK(svac3_dec_nal(d, u[i].p, u[i].len, &f) == 0);
+        if (!f)
+            continue;
+        pics++;
+        /* library pictures too: output order follows decoding order */
+        rising &= svac3_dec_poi(d) > poi;
+        poi = svac3_dec_poi(d);
+    }
+    CHECK(pics == patches && rising);
+
+    /* an RL picture is a P picture: one coded as I is refused */
+    svac3_dec_reset(d);
+    pics = 0;
+    CHECK(feed(d, u, 0, rl + 1, &pics) == 0);
+    static svac3_hls_t h;
+    h = *svac3_dec_hls(d);
+    CHECK(h.patch.nal_unit_type == SVAC3_NAL_RL_PATCH && svac3_patch_supported(&h) == SVAC3_OK);
+    h.ph.picture_coding_type = 1;
+    CHECK(svac3_patch_supported(&h) == SVAC3_ERR_INVALID);
+
+    svac3_dec_reset(d);
+    pics = 0;
+    CHECK(feed(d, u, sps, rl + 1, &pics) == SVAC3_ERR_CORRUPT && pics == 0);
+    svac3_dec_destroy(d);
+}
+
 int main(int argc, char **argv)
 {
-    if (argc != 2) {
-        fprintf(stderr, "usage: %s stream.svac3\n", argv[0]);
+    const int library = argc == 3 && !strcmp(argv[1], "-library");
+    if (argc != 2 && !library) {
+        fprintf(stderr, "usage: %s [-library] stream.svac3\n", argv[0]);
         return 2;
     }
     size_t len;
-    uint8_t *buf = read_file(argv[1], &len);
+    uint8_t *buf = read_file(argv[argc - 1], &len);
     unit_t *u = calloc(len / 3 + 1, sizeof(*u));
     if (!buf || !u)
         return 1;
@@ -60,6 +112,17 @@ int main(int argc, char **argv)
     while (svac3_next_nal(buf, len, &pos, &nal, &nal_len))
         if (nal_len >= 2)
             u[n++] = (unit_t){ nal, nal_len, svac3_nal_is_patch(nal[1] & 31u) };
+
+    if (library) {
+        library_checks(u, n);
+        free(u);
+        free(buf);
+        if (failures)
+            fprintf(stderr, "%d check(s) failed\n", failures);
+        else
+            printf("all checks passed\n");
+        return failures ? 1 : 0;
+    }
 
     /* patch indices: the IDR picture and the two P pictures after it */
     int patch[3], np = 0;

@@ -1146,14 +1146,26 @@ int svac3_patch_supported(const svac3_hls_t *hls)
 
     if (!hls->have_sps || !hls->have_pps || !hls->have_ph || !hls->have_patch)
         return SVAC3_ERR_INVALID;
-    /* patches of display pictures only: no library, crossed or privacy patches */
-    if (hls->patch.nal_unit_type != SVAC3_NAL_NRAP_PATCH &&
-        hls->patch.nal_unit_type != SVAC3_NAL_RAPI_PATCH &&
-        hls->patch.nal_unit_type != SVAC3_NAL_IDR_PATCH)
+    /* display pictures, RL pictures (which reference library pictures) and
+     * displayed library pictures; not the non-displayed library patches
+     * (12, 18), for want of a stream to check them against, nor privacy
+     * patches */
+    const unsigned t = hls->patch.nal_unit_type;
+    if (t == SVAC3_NAL_CRR_DP_PATCH) {
+        if (!s->library_stream_flag)
+            return SVAC3_ERR_INVALID;       /* a library patch in a display stream */
+    } else if (t == SVAC3_NAL_NRAP_PATCH || t == SVAC3_NAL_RAPI_PATCH ||
+               t == SVAC3_NAL_IDR_PATCH || t == SVAC3_NAL_RL_PATCH) {
+        if (s->library_stream_flag)
+            return SVAC3_ERR_INVALID;       /* a display patch in a library stream */
+        if (t == SVAC3_NAL_RL_PATCH && hls->ph.picture_coding_type == 1)
+            return SVAC3_ERR_INVALID;       /* an RL picture references a library picture */
+    } else {
         return SVAC3_ERR_UNSUPPORTED;
+    }
     if (s->profile_id != 0x30 || s->chroma_format != 1 || s->sample_precision != 1)
         return SVAC3_ERR_UNSUPPORTED;
-    if (s->library_picture_enable_flag || s->weight_quant_enable_flag ||
+    if (s->weight_quant_enable_flag ||
         s->st_enable_flag || s->alf_enable_flag || s->affine_enable_flag ||
         s->smvd_enable_flag || s->ipcm_enable_flag || s->amvr_enable_flag ||
         s->num_of_hmvp_cand || s->umve_enable_flag || s->intra_pf_enable_flag ||

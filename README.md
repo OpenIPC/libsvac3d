@@ -17,13 +17,15 @@ The Main profile (0x30) tool set that HiSilicon encoders emit:
 - I and P pictures, one patch per picture;
 - MAEC entropy coding, SRCC coefficients, EIPM (66 intra modes) and MIPF;
 - TMVP, the median motion vector predictor, and skip/direct;
+- several reference pictures, and library pictures (the library stream
+  HiSilicon's SmartP mode interleaves, with RL pictures referencing it);
 - deblocking, SAO and CU delta QP.
 
 Every picture of the test corpus is bit-exact against the reference
 decoder (`tests/golden/*.framemd5`).
 
-Anything else (B pictures, library pictures, several patches, the
-security layer, the High profile's tools) is refused with
+Anything else (B pictures, non-displayed library pictures, several
+patches, the security layer, the High profile's tools) is refused with
 `SVAC3D_ERR_UNSUPPORTED` rather than decoded wrongly.
 
 ## Build
