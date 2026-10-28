@@ -18,3 +18,17 @@ if (NOT MSVC)
 endif()
 target_link_libraries(uavs3dec uavs3d)
 #target_link_libraries(uavs3dec dl)
+
+add_executable(svac3dump tools/svac3dump.c)
+target_include_directories(svac3dump PRIVATE source/svac3)
+target_link_libraries(svac3dump uavs3d)
+
+enable_testing()
+file(GLOB SVAC3_TEST_STREAMS ${CMAKE_SOURCE_DIR}/tests/streams/*.svac3)
+add_executable(test_hls tests/test_hls.c)
+target_include_directories(test_hls PRIVATE source/svac3)
+target_link_libraries(test_hls uavs3d)
+add_test(NAME test_hls
+         COMMAND test_hls ${CMAKE_SOURCE_DIR}/tests/streams/cv608_synth_1080p_cbr2m.svac3)
+add_test(NAME hls_dump
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/hls_dump.sh $<TARGET_FILE:svac3dump> ${SVAC3_TEST_STREAMS})

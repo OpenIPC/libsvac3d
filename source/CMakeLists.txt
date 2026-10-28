@@ -29,8 +29,9 @@ endif()
 # add source
 aux_source_directory(./decoder DIR_UAVS3D_SRC)
 aux_source_directory(./decore DIR_UAVS3D_CORE)
+aux_source_directory(./svac3 DIR_SVAC3_SRC)
 
-list(APPEND DIR_UAVS3D_SRC ${DIR_UAVS3D_CORE})
+list(APPEND DIR_UAVS3D_SRC ${DIR_UAVS3D_CORE} ${DIR_SVAC3_SRC})
 
 include_directories("decore")
 set(UAVS3D_ASM_FILES "")
