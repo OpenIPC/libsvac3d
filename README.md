@@ -1,101 +1,81 @@
-# uavs3d
- uavs3d is an opensource and cross-platform avs3 decoder, supports AVS3-P2 baseline profile. <br>
- features:
- 1) AVS3-P2 baseline profile.
- 2) supports to compile for Android/IOS/Windows/Linux/MacOS systems.
- 3) optimized for ARMv7/ARMv8/SSE4/AVX2 chips.
- 4) 10bit decoding on all supported platforms.
- 5) The uavs3 codec has supported x86 and arm platforms, and has been tested and verified on the Kunpeng processor. 
- 6) The ARM platform recommends the Kunpeng processor.
-# license
-  Copyright reserved by “Peking University Shenzhen Graduate School”, “Peng Cheng Laboratory”, and “Guangdong Bohua UHD Innovation Corporation” <br><br>
-  This program is a free software. You can redistribute it and/or modify it under the terms of the BSD 3-clause license. <br>
-  For more details, please view the file "COPYING" in the project.
-  
-# compile
-  The default configuration only support 8bit decoding. <br>
-  To support 10bit streams decoding: cmake -DCOMPILE_10BIT=1
+# libsvac3d
 
-## windows
-Prerequisites:
-  Visual Studio 2017
+An open-source SVAC 3.0 video decoder, with FFmpeg support.
 
-build:
-  1. ./version.bat (to generate version.h)
-  2. solution file: build/x86_windows/uavs3d.sln 
-  
-  To support 10bit streams decoding, edit source/decore/com_def.h : #define COMPILE_10BIT 1
+SVAC 3.0 is the Chinese surveillance video codec (GB/T 25724, *Surveillance
+Video and Audio Coding*), the successor of SVAC 2.0. Its third edition is
+still a public-comment draft, national standard plan 20243294-T-312, and
+the explanatory note describes it as built on modified AVS3 core coding
+technology. This decoder is written from that draft. Where the draft's text
+disagrees with what reference streams need, `docs/errata.md` says so and
+says what the decoder does instead.
 
-## linux/mac
-Prerequisites:
-  1. gawk (http://www.gnu.org/software/gawk/)
-  2. CMake (https://cmake.org) version 3.1 or higher
-  
-Build:
-  1. mkdir build/linux
-  2. cd build/linux && cmake -DCOMPILE_10BIT=0 ../..
-  3. make && make install
+## What it decodes
 
-  To support 10bit streams decoding: cmake -DCOMPILE_10BIT=1
-  to build shared library, set BUILD_SHARED_LIBS=1 please.
+The Main profile (0x30) tool set that HiSilicon encoders emit:
+- 8-bit 4:2:0;
+- I and P pictures, one patch per picture;
+- MAEC entropy coding, SRCC coefficients, EIPM (66 intra modes) and MIPF;
+- TMVP, the median motion vector predictor, and skip/direct;
+- deblocking, SAO and CU delta QP.
 
-## ios
-Prerequisites:
-  XCode
+Every picture of the test corpus is bit-exact against the reference
+decoder (`tests/golden/*.framemd5`).
 
-Build:
-  1. ./version.sh (generate the version.h) 
-  2. xcode solution file: build/ios/uavs3d.xcodeproj
+Anything else (B pictures, library pictures, several patches, the
+security layer, the High profile's tools) is refused with
+`SVAC3D_ERR_UNSUPPORTED` rather than decoded wrongly.
 
-  To support 10bit streams decoding:
-  Find Xcode -> PROJECT -> Build Settings -> Preprocessor Macros, add COMPILE_10BIT=1
+## Build
 
-## android
-Prerequisites:
-  Android NDK (https://developer.android.google.cn/ndk/downloads/).
+```sh
+cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
+cmake --build build
+ctest --test-dir build
+cmake --install build          # libsvac3d.a, svac3d.h, libsvac3d.pc
+```
 
-Build ndk library or executable file: 
-  1. ./version.sh (generate the version.h)
-  2. cd build/android/ndk/jni
-  3. $NDK_PATH/ndk-build  
+`build/svac3dec stream.svac3 out.yuv` decodes a raw stream to I420.
 
-  To support 10bit streams decoding: edit build/android/ndk/jni/uavs3d_main.mk:
-  
-  LOCAL_CFLAGS	+= -DCOMPILE_10BIT=1
+## API
 
-# Run tests
-## window/linux/mac/android
-sample: ./uavs3d -i input.avs3 -o output.yuv -t 8 -l 2 -s 1
+`source/svac3/svac3d.h` is the installed interface:
 
-Arguments: <br>
+```c
+svac3d_t *d = svac3d_open();
+svac3d_decode(d, buf, len, on_picture, opaque);   /* Annex-B, any whole NAL units */
+svac3d_close(d);
+```
 
-| short name | long name | introduction |
-|:-----------:|----------|-------------|
-| -h | --help     | Print this help     |
-| -v | --version  | Version information |
-| -i | --input    | Input file          |
-| -o | --output   | Output file         |
-| -l | --loglevel | Log level: <br> 0: no message; 1: seq level; 2: frame level (default) |
-| -t | --threads  | Number of frame-level threads |
-| -f | --frames   | Total frames to decode        |
-| -s | --check_md5| Enable to check md5 or not    |
+`on_picture` receives each decoded picture, cropped to the display size.
 
-## ios
-  Edit build/ios/uavs3d/main.m to configure decoding options.
+## FFmpeg
 
-# Contributors
-This program is originally developed by the team of Prof.Ronggang Wang (rgwang@pkusz.edu.cn) at Peking University Shenzhen Graduate School. <br>
+`ffmpeg/` holds a patch for FFmpeg 9.0 that adds:
+- `AV_CODEC_ID_SVAC3`;
+- a parser;
+- a raw `.svac`/`.svac3` demuxer;
+- the `libsvac3d` decoder.
 
-* Main contributors:  
-  * Zhenyu Wang (wangzhenyu@pkusz.edu.cn), Peking University Shenzhen Graduate School. 
-  * Bingjie Han (hanbj@pkusz.edu.cn), Peking University Shenzhen Graduate School. 
-  * Jiang Du, Peking University Shenzhen Graduate School. 
-  * Kui Fan, Peking University Shenzhen Graduate School. 
-  * Xi Xie, Peking University Shenzhen Graduate School. 
-  * Guisen Xu, Peking University Shenzhen Graduate School. 
-  * Xufeng Li, Peking University Shenzhen Graduate School. 
-  * Yangang Cai, Peking University Shenzhen Graduate School. 
-  * Hao Lv, Peng Cheng Laboratory. 
-  * Min Chen.
-  
-  ** Ronggang Wang (rgwang@pkusz.edu.cn), Peking University Shenzhen Graduate School
+Its README has the build steps. CI builds it and checks its framemd5
+output against the golden hashes.
+
+## Layout
+
+| Path | What |
+|---|---|
+| `source/svac3/` | the decoder: NAL and header parsing, MAEC, patch decoding, intra and inter prediction, transforms, loop filters, the picture buffer |
+| `tools/` | `svac3dec`, `svac3dump` (headers), `svac3patch` (patch statistics), `svac3_parse.py` (an independent header parser), `gen_tables.py` (regenerates `svac3_tables.h` from the draft's text) |
+| `tests/` | unit tests, the corpus, golden per-frame MD5s, fuzz targets |
+| `ffmpeg/` | the FFmpeg patch |
+| `source/decoder`, `source/decore` | uavs3d, the AVS3 decoder this repository was forked from; built as `libuavs3d`, unchanged and unused by libsvac3d |
+
+## Licence
+
+BSD 3-clause; see `COPYING`. The uavs3d code is copyright Peking University
+Shenzhen Graduate School, Peng Cheng Laboratory and Guangdong Bohua UHD
+Innovation Corporation. The SVAC3 decoder is copyright OpenIPC
+contributors. The FFmpeg patch is LGPL-2.1-or-later, as FFmpeg is.
+
+The SVAC 3.0 draft itself is not in this repository; the code cites its
+sections and tables.

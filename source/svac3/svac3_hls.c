@@ -707,7 +707,7 @@ int svac3_parse_nal(svac3_hls_t *ctx, const uint8_t *nal, size_t len,
 
     rbsp = malloc(len - 2 ? len - 2 : 1);
     if (!rbsp)
-        return SVAC3_ERR_INVALID;
+        return SVAC3_ERR_NOMEM;
     rbsp_len = svac3_unescape(nal + 2, len - 2, rbsp);
     bits_init(b, rbsp, rbsp_len);
 

@@ -1,0 +1,629 @@
+From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From: Dmitry Ilyin <d.ilyin@openipc.org>
+Date: Wed, 28 Oct 2026 23:38:39 +0300
+Subject: [PATCH] avcodec: add SVAC 3.0 decoding via libsvac3d
+
+Adds AV_CODEC_ID_SVAC3, an access-unit parser, a raw demuxer (.svac,
+.svac3) and a decoder wrapper around libsvac3d
+(https://github.com/OpenIPC/libsvac3d), which decodes the Main profile
+tool set of the GB/T SVAC 3.0 draft.
+---
+ configure                 |   5 +
+ libavcodec/Makefile       |   2 +
+ libavcodec/allcodecs.c    |   1 +
+ libavcodec/codec_desc.c   |   7 ++
+ libavcodec/codec_id.h     |   1 +
+ libavcodec/libsvac3d.c    | 203 ++++++++++++++++++++++++++++++++++++++
+ libavcodec/parsers.c      |   1 +
+ libavcodec/svac3.h        |  54 ++++++++++
+ libavcodec/svac3_parser.c | 118 ++++++++++++++++++++++
+ libavformat/Makefile      |   1 +
+ libavformat/allformats.c  |   1 +
+ libavformat/svac3dec.c    |  64 ++++++++++++
+ 12 files changed, 458 insertions(+)
+ create mode 100644 libavcodec/libsvac3d.c
+ create mode 100644 libavcodec/svac3.h
+ create mode 100644 libavcodec/svac3_parser.c
+ create mode 100644 libavformat/svac3dec.c
+
+diff --git a/configure b/configure
+index 374bd5c..830c135 100755
+--- a/configure
++++ b/configure
+@@ -290,6 +290,7 @@ External library support:
+                            if openssl, gnutls or mbedtls is not used [no]
+   --enable-libtorch        enable Torch as one DNN backend [no]
+   --enable-libtwolame      enable MP2 encoding via libtwolame [no]
++  --enable-libsvac3d       enable SVAC 3.0 decoding via libsvac3d [no]
+   --enable-libuavs3d       enable AVS3 decoding via libuavs3d [no]
+   --enable-libv4l2         enable libv4l2/v4l-utils [no]
+   --enable-libvidstab      enable video stabilization using vid.stab [no]
+@@ -2135,6 +2136,7 @@ EXTERNAL_LIBRARY_LIST="
+     libtls
+     libtorch
+     libtwolame
++    libsvac3d
+     libuavs3d
+     libv4l2
+     libvmaf
+@@ -3874,6 +3876,8 @@ libsvtjpegxs_decoder_deps="libsvtjpegxs"
+ libsvtav1_encoder_select="dovi_rpuenc"
+ libtheora_encoder_deps="libtheora"
+ libtwolame_encoder_deps="libtwolame"
++libsvac3d_decoder_deps="libsvac3d"
++libsvac3d_decoder_select="svac3_parser"
+ libuavs3d_decoder_deps="libuavs3d"
+ libvo_amrwbenc_encoder_deps="libvo_amrwbenc"
+ libvorbis_decoder_deps="libvorbis"
+@@ -7452,6 +7456,7 @@ enabled libtorch          && check_cxxflags -std=c++17 && require_cxx libtorch t
+ enabled libtwolame        && require libtwolame twolame.h twolame_init -ltwolame &&
+                              { check_lib libtwolame twolame.h twolame_encode_buffer_float32_interleaved -ltwolame ||
+                                die "ERROR: libtwolame must be installed and version must be >= 0.3.10"; }
++enabled libsvac3d         && require_pkg_config libsvac3d "libsvac3d >= 0.1.0" svac3d.h svac3d_open
+ enabled libuavs3d         && require_pkg_config libuavs3d "uavs3d >= 1.1.41" uavs3d.h uavs3d_decode
+ enabled libv4l2           && require_pkg_config libv4l2 libv4l2 libv4l2.h v4l2_ioctl
+ enabled libvidstab        && require_pkg_config libvidstab "vidstab >= 0.98" vid.stab/libvidstab.h vsMotionDetectInit
+diff --git a/libavcodec/Makefile b/libavcodec/Makefile
+index 95ba308..373d9e3 100644
+--- a/libavcodec/Makefile
++++ b/libavcodec/Makefile
+@@ -1209,6 +1209,7 @@ OBJS-$(CONFIG_LIBSVTJPEGXS_DECODER)       += libsvtjpegxsdec.o
+ OBJS-$(CONFIG_LIBSVTJPEGXS_ENCODER)       += libsvtjpegxsenc.o
+ OBJS-$(CONFIG_LIBTHEORA_ENCODER)          += libtheoraenc.o
+ OBJS-$(CONFIG_LIBTWOLAME_ENCODER)         += libtwolame.o
++OBJS-$(CONFIG_LIBSVAC3D_DECODER)          += libsvac3d.o
+ OBJS-$(CONFIG_LIBUAVS3D_DECODER)          += libuavs3d.o
+ OBJS-$(CONFIG_LIBVO_AMRWBENC_ENCODER)     += libvo-amrwbenc.o
+ OBJS-$(CONFIG_LIBVORBIS_DECODER)          += libvorbisdec.o
+@@ -1292,6 +1293,7 @@ OBJS-$(CONFIG_PRORES_PARSER)           += prores_parser.o
+ OBJS-$(CONFIG_RV34_PARSER)             += rv34_parser.o
+ OBJS-$(CONFIG_SBC_PARSER)              += sbc_parser.o
+ OBJS-$(CONFIG_SIPR_PARSER)             += sipr_parser.o
++OBJS-$(CONFIG_SVAC3_PARSER)            += svac3_parser.o
+ OBJS-$(CONFIG_TAK_PARSER)              += tak_parser.o tak.o
+ OBJS-$(CONFIG_VC1_PARSER)              += vc1_parser.o vc1.o vc1data.o  \
+                                           wmv2data.o
+diff --git a/libavcodec/allcodecs.c b/libavcodec/allcodecs.c
+index 47eded2..e7f4f45 100644
+--- a/libavcodec/allcodecs.c
++++ b/libavcodec/allcodecs.c
+@@ -808,6 +808,7 @@ extern const FFCodec ff_libsvtjpegxs_encoder;
+ extern const FFCodec ff_libsvtjpegxs_decoder;
+ extern const FFCodec ff_libtheora_encoder;
+ extern const FFCodec ff_libtwolame_encoder;
++extern const FFCodec ff_libsvac3d_decoder;
+ extern const FFCodec ff_libuavs3d_decoder;
+ extern const FFCodec ff_libvo_amrwbenc_encoder;
+ extern const FFCodec ff_libvorbis_encoder;
+diff --git a/libavcodec/codec_desc.c b/libavcodec/codec_desc.c
+index 81c095b..27a499a 100644
+--- a/libavcodec/codec_desc.c
++++ b/libavcodec/codec_desc.c
+@@ -1992,6 +1992,13 @@ static const AVCodecDescriptor codec_descriptors[] = {
+         .props     = AV_CODEC_PROP_LOSSY | AV_CODEC_PROP_LOSSLESS,
+         .mime_types= MT("image/webp"),
+     },
++    {
++        .id        = AV_CODEC_ID_SVAC3,
++        .type      = AVMEDIA_TYPE_VIDEO,
++        .name      = "svac3",
++        .long_name = NULL_IF_CONFIG_SMALL("SVAC 3.0 (GB/T Surveillance Video and Audio Coding)"),
++        .props     = AV_CODEC_PROP_LOSSY,
++    },
+ 
+     /* various PCM "codecs" */
+     {
+diff --git a/libavcodec/codec_id.h b/libavcodec/codec_id.h
+index 668a068..a089876 100644
+--- a/libavcodec/codec_id.h
++++ b/libavcodec/codec_id.h
+@@ -324,6 +324,7 @@ enum AVCodecID {
+     AV_CODEC_ID_PRORES_RAW,
+     AV_CODEC_ID_JPEGXS,
+     AV_CODEC_ID_WEBP_ANIM,
++    AV_CODEC_ID_SVAC3,
+ 
+     /* various PCM "codecs" */
+     AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs
+diff --git a/libavcodec/libsvac3d.c b/libavcodec/libsvac3d.c
+new file mode 100644
+index 0000000..1e4060b
+--- /dev/null
++++ b/libavcodec/libsvac3d.c
+@@ -0,0 +1,203 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * SVAC 3.0 decoding through libsvac3d
++ */
++
++#include <svac3d.h>
++
++#include "libavutil/fifo.h"
++#include "libavutil/imgutils.h"
++#include "avcodec.h"
++#include "codec_internal.h"
++#include "decode.h"
++
++typedef struct LibSVAC3DContext {
++    svac3d_t *dec;
++    AVCodecContext *avctx;
++    AVPacket *pkt;
++    AVFifo *frames;          ///< decoded pictures not yet returned, AVFrame *
++    int err;                 ///< error raised inside the output callback
++    int pending_err;         ///< error to return once the queued pictures are out
++} LibSVAC3DContext;
++
++static int svac3d_error(int err)
++{
++    switch (err) {
++    case SVAC3D_ERR_UNSUPPORTED: return AVERROR_PATCHWELCOME;
++    case SVAC3D_ERR_NOMEM:       return AVERROR(ENOMEM);
++    case SVAC3D_ERR_ARG:         return AVERROR(EINVAL);
++    default:                     return AVERROR_INVALIDDATA;
++    }
++}
++
++/* Called by svac3d_decode() for each picture: copy it into a frame of our
++ * own and queue it, since one packet may complete several pictures. */
++static void svac3d_output(void *opaque, const svac3d_picture_t *pic)
++{
++    LibSVAC3DContext *s = opaque;
++    AVCodecContext *avctx = s->avctx;
++    svac3d_info_t info;
++    AVFrame *frame;
++    int ret;
++
++    if (s->err)
++        return;
++    if (pic->width != avctx->width || pic->height != avctx->height) {
++        ret = ff_set_dimensions(avctx, pic->width, pic->height);
++        if (ret < 0) {
++            s->err = ret;
++            return;
++        }
++    }
++    if (!svac3d_get_info(s->dec, &info) && info.frame_rate_num)
++        avctx->framerate = (AVRational){ info.frame_rate_num, info.frame_rate_den };
++
++    frame = av_frame_alloc();
++    if (!frame) {
++        s->err = AVERROR(ENOMEM);
++        return;
++    }
++    ret = ff_get_buffer(avctx, frame, 0);
++    if (ret < 0) {
++        av_frame_free(&frame);
++        s->err = ret;
++        return;
++    }
++    for (int i = 0; i < 3; i++) {
++        const int w = i ? AV_CEIL_RSHIFT(pic->width, 1) : pic->width;
++        const int h = i ? AV_CEIL_RSHIFT(pic->height, 1) : pic->height;
++        av_image_copy_plane(frame->data[i], frame->linesize[i],
++                            pic->data[i], pic->linesize[i], w, h);
++    }
++    frame->pict_type = pic->pict_type == 1 ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
++    if (pic->pict_type == 1)
++        frame->flags |= AV_FRAME_FLAG_KEY;
++    else
++        frame->flags &= ~AV_FRAME_FLAG_KEY;
++    ret = av_fifo_write(s->frames, &frame, 1);
++    if (ret < 0) {
++        av_frame_free(&frame);
++        s->err = ret;
++    }
++}
++
++static void drop_frames(LibSVAC3DContext *s)
++{
++    AVFrame *frame;
++
++    while (s->frames && av_fifo_read(s->frames, &frame, 1) >= 0)
++        av_frame_free(&frame);
++}
++
++static av_cold int libsvac3d_init(AVCodecContext *avctx)
++{
++    LibSVAC3DContext *s = avctx->priv_data;
++
++    s->avctx  = avctx;
++    s->pkt    = av_packet_alloc();
++    s->frames = av_fifo_alloc2(2, sizeof(AVFrame *), AV_FIFO_FLAG_AUTO_GROW);
++    s->dec    = svac3d_open();
++    if (!s->pkt || !s->frames || !s->dec)
++        return AVERROR(ENOMEM);
++    avctx->pix_fmt = AV_PIX_FMT_YUV420P;
++
++    /* parameter sets carried out of band */
++    if (avctx->extradata_size > 0) {
++        int ret = svac3d_decode(s->dec, avctx->extradata, avctx->extradata_size, NULL, NULL);
++        if (ret < 0) {
++            av_log(avctx, AV_LOG_WARNING, "Could not decode extradata (%d)\n", ret);
++            if (avctx->err_recognition & AV_EF_EXPLODE)
++                return svac3d_error(ret);
++        }
++    }
++    return 0;
++}
++
++static av_cold int libsvac3d_close(AVCodecContext *avctx)
++{
++    LibSVAC3DContext *s = avctx->priv_data;
++
++    drop_frames(s);
++    av_fifo_freep2(&s->frames);
++    av_packet_free(&s->pkt);
++    svac3d_close(s->dec);
++    s->dec = NULL;
++    return 0;
++}
++
++static void libsvac3d_flush(AVCodecContext *avctx)
++{
++    LibSVAC3DContext *s = avctx->priv_data;
++
++    drop_frames(s);
++    s->pending_err = 0;
++    svac3d_reset(s->dec);
++}
++
++static int libsvac3d_receive_frame(AVCodecContext *avctx, AVFrame *frame)
++{
++    LibSVAC3DContext *s = avctx->priv_data;
++    AVFrame *out;
++    int ret;
++
++    for (;;) {
++        if (av_fifo_read(s->frames, &out, 1) >= 0) {
++            av_frame_move_ref(frame, out);
++            av_frame_free(&out);
++            return 0;
++        }
++        if (s->pending_err) {
++            /* reported after the pictures the same packet did produce */
++            ret = s->pending_err;
++            s->pending_err = 0;
++            return ret;
++        }
++
++        ret = ff_decode_get_packet(avctx, s->pkt);
++        if (ret < 0)
++            return ret;                     /* EAGAIN, or EOF: no pictures are held back */
++        s->err = 0;
++        ret = svac3d_decode(s->dec, s->pkt->data, s->pkt->size, svac3d_output, s);
++        av_packet_unref(s->pkt);
++        if (s->err < 0) {
++            s->pending_err = s->err;
++        } else if (ret < 0) {
++            av_log(avctx, AV_LOG_ERROR, "Decoding failed (%d)%s\n", ret,
++                   ret == SVAC3D_ERR_CORRUPT ? ": corrupt patch, or its reference is missing" : "");
++            s->pending_err = svac3d_error(ret);
++        }
++    }
++}
++
++const FFCodec ff_libsvac3d_decoder = {
++    .p.name         = "libsvac3d",
++    CODEC_LONG_NAME("libsvac3d SVAC 3.0"),
++    .p.type         = AVMEDIA_TYPE_VIDEO,
++    .p.id           = AV_CODEC_ID_SVAC3,
++    .priv_data_size = sizeof(LibSVAC3DContext),
++    .init           = libsvac3d_init,
++    .close          = libsvac3d_close,
++    .flush          = libsvac3d_flush,
++    FF_CODEC_RECEIVE_FRAME_CB(libsvac3d_receive_frame),
++    .p.capabilities = AV_CODEC_CAP_DR1,
++    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
++    .p.wrapper_name = "libsvac3d",
++};
+diff --git a/libavcodec/parsers.c b/libavcodec/parsers.c
+index b54442a..ec8fc55 100644
+--- a/libavcodec/parsers.c
++++ b/libavcodec/parsers.c
+@@ -78,6 +78,7 @@ extern const FFCodecParser ff_qoi_parser;
+ extern const FFCodecParser ff_rv34_parser;
+ extern const FFCodecParser ff_sbc_parser;
+ extern const FFCodecParser ff_sipr_parser;
++extern const FFCodecParser ff_svac3_parser;
+ extern const FFCodecParser ff_tak_parser;
+ extern const FFCodecParser ff_vc1_parser;
+ extern const FFCodecParser ff_vorbis_parser;
+diff --git a/libavcodec/svac3.h b/libavcodec/svac3.h
+new file mode 100644
+index 0000000..ba3f4c1
+--- /dev/null
++++ b/libavcodec/svac3.h
+@@ -0,0 +1,54 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++#ifndef AVCODEC_SVAC3_H
++#define AVCODEC_SVAC3_H
++
++/* NAL unit types of SVAC 3.0 (draft GB/T, plan 20243294-T-312), 2-byte header */
++enum {
++    SVAC3_NAL_NRAP_PATCH = 1,
++    SVAC3_NAL_RAPI_PATCH = 2,
++    SVAC3_NAL_PIC_HEADER = 3,
++    SVAC3_NAL_IDR_PATCH  = 4,
++    SVAC3_NAL_EXTENSION  = 5,
++    SVAC3_NAL_SEI        = 6,
++    SVAC3_NAL_SPS        = 7,
++    SVAC3_NAL_PPS        = 8,
++    SVAC3_NAL_SEC_PS     = 9,
++    SVAC3_NAL_AUTH_DATA  = 10,
++    SVAC3_NAL_EOS        = 11,
++};
++
++#define SVAC3_NAL_TYPE(h1) ((h1) & 0x1f)
++
++/* Types that carry patch data: display, library, crossed and privacy patches */
++static inline int ff_svac3_nal_is_patch(int type)
++{
++    return type == 1 || type == 2 || type == 4 || type == 12 || type == 14 ||
++           (type >= 17 && type <= 19);
++}
++
++/* Types that open an access unit when they follow its patches */
++static inline int ff_svac3_nal_starts_au(int type)
++{
++    return type == SVAC3_NAL_PIC_HEADER || type == SVAC3_NAL_EXTENSION ||
++           type == SVAC3_NAL_SEI || type == SVAC3_NAL_SPS || type == SVAC3_NAL_PPS ||
++           type == SVAC3_NAL_SEC_PS;
++}
++
++#endif /* AVCODEC_SVAC3_H */
+diff --git a/libavcodec/svac3_parser.c b/libavcodec/svac3_parser.c
+new file mode 100644
+index 0000000..73bbf5e
+--- /dev/null
++++ b/libavcodec/svac3_parser.c
+@@ -0,0 +1,118 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * SVAC 3.0 parser: splits an Annex-B stream into access units, each the
++ * parameter sets, picture header and patches of one picture.
++ */
++
++#include "parser.h"
++#include "parser_internal.h"
++#include "svac3.h"
++
++typedef struct SVAC3ParseContext {
++    ParseContext pc;
++    int patch_seen;          ///< the access unit being collected has a patch
++} SVAC3ParseContext;
++
++static int svac3_find_frame_end(SVAC3ParseContext *p, const uint8_t *buf, int buf_size)
++{
++    ParseContext *pc = &p->pc;
++    uint64_t state = pc->state64;
++
++    for (int i = 0; i < buf_size; i++) {
++        int type;
++
++        state = (state << 8) | buf[i];
++        /* 00 00 01 and the two header bytes */
++        if ((state & 0xFFFFFF0000ULL) != 0x10000ULL)
++            continue;
++        type = SVAC3_NAL_TYPE(state);
++        if (ff_svac3_nal_is_patch(type)) {
++            p->patch_seen = 1;
++        } else if (p->patch_seen && ff_svac3_nal_starts_au(type)) {
++            p->patch_seen = 0;
++            pc->state64   = -1;
++            return i - 4;
++        }
++    }
++    pc->state64 = state;
++    return END_NOT_FOUND;
++}
++
++static void svac3_parse_units(AVCodecParserContext *s, const uint8_t *buf, int buf_size)
++{
++    const uint8_t *end = buf + buf_size;
++
++    s->key_frame = 0;
++    s->pict_type = AV_PICTURE_TYPE_NONE;
++    for (const uint8_t *p = buf; p + 4 < end; p++) {
++        int type;
++
++        if (p[0] || p[1] || p[2] != 1)
++            continue;
++        type = SVAC3_NAL_TYPE(p[4]);
++        if (type == SVAC3_NAL_IDR_PATCH || type == SVAC3_NAL_RAPI_PATCH) {
++            s->key_frame = 1;
++            s->pict_type = AV_PICTURE_TYPE_I;
++        }
++        p += 2;
++    }
++}
++
++static int svac3_parse(AVCodecParserContext *s, AVCodecContext *avctx,
++                       const uint8_t **poutbuf, int *poutbuf_size,
++                       const uint8_t *buf, int buf_size)
++{
++    SVAC3ParseContext *p = s->priv_data;
++    int next;
++
++    if (s->flags & PARSER_FLAG_COMPLETE_FRAMES) {
++        next = buf_size;
++    } else {
++        next = svac3_find_frame_end(p, buf, buf_size);
++        if (ff_combine_frame(&p->pc, next, &buf, &buf_size) < 0) {
++            *poutbuf      = NULL;
++            *poutbuf_size = 0;
++            return buf_size;
++        }
++    }
++
++    svac3_parse_units(s, buf, buf_size);
++
++    *poutbuf      = buf;
++    *poutbuf_size = buf_size;
++    return next;
++}
++
++static av_cold int svac3_parser_init(AVCodecParserContext *s)
++{
++    SVAC3ParseContext *p = s->priv_data;
++
++    p->pc.state64 = -1;
++    return 0;
++}
++
++const FFCodecParser ff_svac3_parser = {
++    PARSER_CODEC_LIST(AV_CODEC_ID_SVAC3),
++    .priv_data_size = sizeof(SVAC3ParseContext),
++    .init           = svac3_parser_init,
++    .parse          = svac3_parse,
++    .close          = ff_parse_close,
++};
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 0d2e757..38e7b3a 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -595,6 +595,7 @@ OBJS-$(CONFIG_SUBVIEWER1_DEMUXER)        += subviewer1dec.o subtitles.o
+ OBJS-$(CONFIG_SUBVIEWER_DEMUXER)         += subviewerdec.o subtitles.o
+ OBJS-$(CONFIG_SUP_DEMUXER)               += supdec.o
+ OBJS-$(CONFIG_SUP_MUXER)                 += supenc.o
++OBJS-$(CONFIG_SVAC3_DEMUXER)             += svac3dec.o rawdec.o
+ OBJS-$(CONFIG_SVAG_DEMUXER)              += svag.o
+ OBJS-$(CONFIG_SVS_DEMUXER)               += svs.o
+ OBJS-$(CONFIG_SWF_DEMUXER)               += swfdec.o swf.o
+diff --git a/libavformat/allformats.c b/libavformat/allformats.c
+index af7eea5..0fea4ff 100644
+--- a/libavformat/allformats.c
++++ b/libavformat/allformats.c
+@@ -462,6 +462,7 @@ extern const FFInputFormat  ff_subviewer1_demuxer;
+ extern const FFInputFormat  ff_subviewer_demuxer;
+ extern const FFInputFormat  ff_sup_demuxer;
+ extern const FFOutputFormat ff_sup_muxer;
++extern const FFInputFormat  ff_svac3_demuxer;
+ extern const FFInputFormat  ff_svag_demuxer;
+ extern const FFInputFormat  ff_svs_demuxer;
+ extern const FFInputFormat  ff_swf_demuxer;
+diff --git a/libavformat/svac3dec.c b/libavformat/svac3dec.c
+new file mode 100644
+index 0000000..efe2901
+--- /dev/null
++++ b/libavformat/svac3dec.c
+@@ -0,0 +1,64 @@
++/*
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/**
++ * @file
++ * Raw SVAC 3.0 video demuxer
++ */
++
++#include "libavcodec/svac3.h"
++#include "avformat.h"
++#include "rawdec.h"
++
++static int svac3_probe(const AVProbeData *p)
++{
++    const uint8_t *buf = p->buf, *end = p->buf + p->buf_size;
++    int sps = 0, ph = 0, patch = 0;
++
++    for (; buf + 5 < end; buf++) {
++        int type;
++
++        if (buf[0] || buf[1] || buf[2] != 1)
++            continue;
++        if (buf[3] & 0x80)
++            return 0;                       /* forbidden_zero_bit */
++        type = SVAC3_NAL_TYPE(buf[4]);
++        if (type == SVAC3_NAL_SPS) {
++            /* profile_id: Main 0x30, High 0x40, the 0x42 variant */
++            if (buf[5] != 0x30 && buf[5] != 0x40 && buf[5] != 0x42)
++                return 0;
++            sps++;
++        } else if (type == SVAC3_NAL_PIC_HEADER) {
++            ph++;
++        } else if (ff_svac3_nal_is_patch(type)) {
++            if (!sps || !ph)
++                return 0;                   /* a patch before its headers */
++            patch++;
++        } else if (type == 0 || type > 19) {
++            return 0;
++        }
++        buf += 4;
++    }
++
++    /* the start codes and NAL headers are those of other codecs too */
++    if (sps && ph && patch && av_match_ext(p->filename, "svac,svac3"))
++        return AVPROBE_SCORE_EXTENSION + 1;
++    return 0;
++}
++
++FF_DEF_RAWVIDEO_DEMUXER(svac3, "raw SVAC 3.0", svac3_probe, "svac,svac3", AV_CODEC_ID_SVAC3)
+-- 
+2.54.0
+

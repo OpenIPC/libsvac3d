@@ -33,6 +33,9 @@ void svac3_dec_reset(svac3_dec_t *d);
 
 const svac3_hls_t *svac3_dec_hls(const svac3_dec_t *d);
 
+/* POI of the last picture decoded */
+int64_t svac3_dec_poi(const svac3_dec_t *d);
+
 /* Statistics of the last patch decoded */
 const svac3_patch_stats_t *svac3_dec_stats(const svac3_dec_t *d);
 
