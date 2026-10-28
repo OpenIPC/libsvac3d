@@ -125,7 +125,7 @@ class Parser:
         for i in range(n):
             lib = b.u(1) if r["reference_to_library_enable_flag"] else 0
             if lib:
-                deltas.append(("lib", b.ue()))
+                deltas.append(f"L{b.ue()}")
             else:
                 a = b.ue()
                 s = b.u(1) if a > 0 else 0
