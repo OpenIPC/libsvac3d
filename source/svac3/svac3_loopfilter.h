@@ -20,6 +20,11 @@ typedef struct {
     int alpha_offset, beta_offset;
     int filter_type;             /* DeblockingFilterType */
     int cb_delta, cr_delta;      /* chroma_quant_param_delta_cb/cr */
+    /* inter pictures only (inter == 0 treats every unit as intra) */
+    int inter;
+    const uint8_t *cbf;          /* the coding unit has coefficients */
+    const int8_t *ref;           /* L0 reference index, -1 when intra */
+    const int16_t *mv;           /* L0 motion vector, two per unit */
 } svac3_dbk_info_t;
 
 /* All vertical edges of the picture are filtered before any horizontal

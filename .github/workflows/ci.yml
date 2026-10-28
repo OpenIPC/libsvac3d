@@ -43,6 +43,7 @@ jobs:
           clang $F tests/fuzz/fuzz_hls.c source/svac3/svac3_hls.c -o fuzz_hls
           clang $F tests/fuzz/fuzz_patch.c source/svac3/svac3_hls.c source/svac3/svac3_aec.c \
             source/svac3/svac3_patch.c source/svac3/svac3_recon.c source/svac3/svac3_loopfilter.c \
+            source/svac3/svac3_inter.c source/svac3/svac3_dec.c \
             -o fuzz_patch
       - name: Fuzz the header parser for 60 s
         run: |

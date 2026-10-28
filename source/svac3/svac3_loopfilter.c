@@ -39,6 +39,17 @@ static inline int cu_edge(const svac3_dbk_info_t *d, int xp, int yp, int xq, int
     return d->cu_id[unit(d, xp, yp)] != d->cu_id[unit(d, xq, yq)];
 }
 
+/* 5.4.11.4, first paragraph: an edge between two inter coding units with
+ * no coefficients, the same reference and motion vectors less than one
+ * sample apart has Bs 0 (P pictures: list 1 is unused on both sides). */
+static int inter_bs0(const svac3_dbk_info_t *d, int up, int uq)
+{
+    if (!d->inter || d->cbf[up] || d->cbf[uq] || d->ref[up] < 0 || d->ref[uq] < 0)
+        return 0;
+    return d->ref[up] == d->ref[uq] && iabs(d->mv[2 * up] - d->mv[2 * uq]) < 4 &&
+           iabs(d->mv[2 * up + 1] - d->mv[2 * uq + 1]) < 4;
+}
+
 /* 5.4.11.4 (intra in both coding units: Bs from the samples) and the
  * filters of 5.4.11.5-5.4.11.10. s points at q0; step is the distance
  * between p0 and q0 (1 for a vertical edge, stride for a horizontal one). */
@@ -135,7 +146,7 @@ static void luma_edge(svac3_frame_t *f, const svac3_dbk_info_t *d, int bx, int b
         if (x >= d->pic_w || y >= d->pic_h)
             break;
         const int xp = ver ? x - 1 : x, yp = ver ? y : y - 1;
-        if (!cu_edge(d, xp, yp, x, y))
+        if (!cu_edge(d, xp, yp, x, y) || inter_bs0(d, unit(d, xp, yp), unit(d, x, y)))
             continue;
         const int qpav = (d->qp[unit(d, xp, yp)] + d->qp[unit(d, x, y)] + 1) >> 1;
         filter_line(Y + y * s + x, ver ? 1 : s, qpav, d, 0);
@@ -155,7 +166,7 @@ static void chroma_edge(svac3_frame_t *f, const svac3_dbk_info_t *d, int bx, int
                 break;
             const int lx = 2 * x, ly = 2 * y;
             const int lxp = ver ? lx - 1 : lx, lyp = ver ? ly : ly - 1;
-            if (!cu_edge(d, lxp, lyp, lx, ly))
+            if (!cu_edge(d, lxp, lyp, lx, ly) || inter_bs0(d, unit(d, lxp, lyp), unit(d, lx, ly)))
                 continue;
             const int qpp = svac3_chroma_qp(d->qp[unit(d, lxp, lyp)], delta);
             const int qpq = svac3_chroma_qp(d->qp[unit(d, lx, ly)], delta);

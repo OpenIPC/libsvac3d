@@ -1,7 +1,7 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright (c) 2026 OpenIPC contributors
  *
- * Unit tests for the SVAC3 patch parser's input checks.
+ * Unit tests for the SVAC3 patch decoder's input checks.
  * usage: test_patch <stream.svac3>   (a Main-profile stream from tests/streams)
  */
 #include <stdint.h>
@@ -94,19 +94,66 @@ int main(int argc, char **argv)
             .height = { H, H / 2, H / 2 },
         };
         CHECK(pix != NULL);
-        CHECK(svac3_patch_decode(hls, rbsp, rl, &fr, &st) == SVAC3_OK);
+        CHECK(svac3_patch_decode(hls, rbsp, rl, &fr, NULL, NULL, &st) == SVAC3_OK);
         svac3_frame_t bad = fr;
         bad.height[0] = H - 8;
-        CHECK(svac3_patch_decode(hls, rbsp, rl, &bad, &st) == SVAC3_ERR_INVALID);
+        CHECK(svac3_patch_decode(hls, rbsp, rl, &bad, NULL, NULL, &st) == SVAC3_ERR_INVALID);
         bad = fr;
         bad.stride[1] = W / 2 - 1;
-        CHECK(svac3_patch_decode(hls, rbsp, rl, &bad, &st) == SVAC3_ERR_INVALID);
+        CHECK(svac3_patch_decode(hls, rbsp, rl, &bad, NULL, NULL, &st) == SVAC3_ERR_INVALID);
         bad = fr;
         bad.plane[2] = NULL;
-        CHECK(svac3_patch_decode(hls, rbsp, rl, &bad, &st) == SVAC3_ERR_INVALID);
+        CHECK(svac3_patch_decode(hls, rbsp, rl, &bad, NULL, NULL, &st) == SVAC3_ERR_INVALID);
         /* a truncated patch is corrupt when reconstructing, only reported when parsing */
-        CHECK(svac3_patch_decode(hls, rbsp, rl / 2, &fr, &st) == SVAC3_ERR_CORRUPT);
+        CHECK(svac3_patch_decode(hls, rbsp, rl / 2, &fr, NULL, NULL, &st) == SVAC3_ERR_CORRUPT);
         CHECK(svac3_patch_parse(hls, rbsp, rl / 2, &st) == SVAC3_OK && !st.stuffing_ok);
+        free(pix);
+    }
+
+    /* a P picture is reconstructed only against references that fit it */
+    {
+        const int W = hls->sps.pic_width_in_luma, H = hls->sps.pic_height_in_luma;
+        const size_t fs = (size_t)W * H * 3 / 2;
+        uint8_t *pix = calloc(fs * 2, 1);
+        svac3_tmv_t *tmv = calloc(svac3_tmv_count(W, H), sizeof(*tmv));
+        CHECK(pix != NULL && tmv != NULL);
+        svac3_frame_t ref = {
+            .plane = { pix, pix + (size_t)W * H, pix + (size_t)W * H * 5 / 4 },
+            .stride = { W, W / 2, W / 2 },
+            .width = { W, W / 2, W / 2 },
+            .height = { H, H / 2, H / 2 },
+        }, cur = ref;
+        for (int c = 0; c < 3; c++)
+            cur.plane[c] += fs;
+        CHECK(svac3_patch_decode(hls, rbsp, rl, &ref, NULL, tmv, &st) == SVAC3_OK);
+
+        /* the next patch is the first P picture */
+        size_t prl = 0;
+        while (svac3_next_nal(buf, len, &pos, &nal, &nal_len)) {
+            if (nal_len < 2 || svac3_parse_nal(hls, nal, nal_len, 0, NULL))
+                continue;
+            if (svac3_nal_is_patch(nal[1] & 31u)) {
+                prl = svac3_unescape(nal + 2, nal_len - 2, rbsp);
+                break;
+            }
+        }
+        CHECK(prl > 0 && hls->ph.picture_coding_type == 2);
+        svac3_refs_t refs = { .num = 1, .ref = { &ref }, .dist = { 2 }, .col = tmv };
+        CHECK(svac3_patch_decode(hls, rbsp, prl, &cur, NULL, NULL, &st) == SVAC3_ERR_INVALID);
+        svac3_refs_t r = refs;
+        r.num = 0;
+        CHECK(svac3_patch_decode(hls, rbsp, prl, &cur, &r, NULL, &st) == SVAC3_ERR_INVALID);
+        r = refs;
+        r.col = NULL;                        /* TMVP is on in the corpus */
+        CHECK(svac3_patch_decode(hls, rbsp, prl, &cur, &r, NULL, &st) == SVAC3_ERR_INVALID);
+        svac3_frame_t small = ref;
+        small.height[0] = H - 8;
+        r = refs;
+        r.ref[0] = &small;
+        CHECK(svac3_patch_decode(hls, rbsp, prl, &cur, &r, NULL, &st) == SVAC3_ERR_INVALID);
+        CHECK(svac3_patch_decode(hls, rbsp, prl, &cur, &refs, NULL, &st) == SVAC3_OK);
+        CHECK(svac3_patch_parse(hls, rbsp, prl, &st) == SVAC3_OK && st.stuffing_ok);
+        free(tmv);
         free(pix);
     }
 

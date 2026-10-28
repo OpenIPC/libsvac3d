@@ -43,6 +43,11 @@ target_include_directories(test_patch PRIVATE source/svac3 tools)
 target_link_libraries(test_patch uavs3d)
 add_test(NAME test_patch
          COMMAND test_patch ${CMAKE_SOURCE_DIR}/tests/streams/cv608_synth_1080p_cbr2m.svac3)
+add_executable(test_dec tests/test_dec.c)
+target_include_directories(test_dec PRIVATE source/svac3 tools)
+target_link_libraries(test_dec uavs3d)
+add_test(NAME test_dec
+         COMMAND test_dec ${CMAKE_SOURCE_DIR}/tests/streams/cv608_synth_1080p_cbr2m.svac3)
 find_package(Python3 COMPONENTS Interpreter REQUIRED)
 foreach(stream ${SVAC3_TEST_STREAMS})
     get_filename_component(name ${stream} NAME_WE)
