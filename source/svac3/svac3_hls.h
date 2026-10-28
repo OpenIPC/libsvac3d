@@ -19,6 +19,8 @@ enum {
     SVAC3_ERR_EOF         = -1, /* read past the end of an RBSP */
     SVAC3_ERR_UNSUPPORTED = -2, /* valid syntax this decoder does not handle yet */
     SVAC3_ERR_INVALID     = -3, /* value out of range, or a parameter set is missing */
+    SVAC3_ERR_CORRUPT     = -4, /* patch data out of sync or truncated */
+    SVAC3_ERR_NOMEM       = -5, /* allocation failed */
 };
 
 /* nal_unit_type, 表55 */

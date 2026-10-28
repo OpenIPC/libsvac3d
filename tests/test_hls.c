@@ -8,6 +8,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "read_file.h"
 #include "svac3_hls.h"
 
 static int failures;
@@ -71,13 +72,14 @@ static size_t bw_nal(bw_t *w, uint8_t type, uint8_t *out)
 
 /* A Main-profile (0x30) 64x64 SPS with one RPL set of one reference.
  * wq_coeff > 0 enables a sequence weight-quant matrix filled with it. */
-static size_t make_sps(uint8_t *out, uint32_t abs_delta_doi, uint32_t wq_coeff)
+static size_t make_sps_sized(uint8_t *out, uint32_t abs_delta_doi, uint32_t wq_coeff,
+                             int disp_w, int disp_h)
 {
     bw_t w;
     memset(&w, 0, sizeof(w));
     wu(&w, 8, 0x30); wu(&w, 8, 0x50);
     wu(&w, 1, 0); wu(&w, 1, 0); wu(&w, 1, 0); wu(&w, 1, 0);     /* nesting, library x2, rapi */
-    wu(&w, 14, 64); wu(&w, 14, 64); wu(&w, 14, 64); wu(&w, 14, 64);
+    wu(&w, 14, (uint32_t)disp_w); wu(&w, 14, (uint32_t)disp_h); wu(&w, 14, 64); wu(&w, 14, 64);
     wu(&w, 2, 1); wu(&w, 3, 1); wu(&w, 4, 1); wu(&w, 4, 3);     /* 4:2:0, 8 bit, aspect, fps */
     wu(&w, 18, 1); wu(&w, 12, 0);                                /* bit rate */
     wu(&w, 1, 0); wu(&w, 18, 1); wu(&w, 4, 3);                   /* temporal id, bbv, max_dpb_size_minus1 */
@@ -109,6 +111,11 @@ static size_t make_sps(uint8_t *out, uint32_t abs_delta_doi, uint32_t wq_coeff)
     return bw_nal(&w, SVAC3_NAL_SPS, out);
 }
 
+static size_t make_sps(uint8_t *out, uint32_t abs_delta_doi, uint32_t wq_coeff)
+{
+    return make_sps_sized(out, abs_delta_doi, wq_coeff, 64, 64);
+}
+
 static int parse(svac3_hls_t *ctx, const uint8_t *nal, size_t len)
 {
     return svac3_parse_nal(ctx, nal, len, 0, NULL);
@@ -136,6 +143,12 @@ static void test_rpl_and_wq_ranges(void)
     CHECK(parse(&ctx, nal, make_sps(nal, 1, 255)) == SVAC3_OK);
     CHECK(ctx.sps.wq_matrix4x4[0] == 255 && ctx.sps.wq_matrix8x8[63] == 255);
     CHECK(parse(&ctx, nal, make_sps(nal, 1, 256)) == SVAC3_ERR_INVALID && !ctx.have_sps);
+
+    /* the display size lies within the coded size, and is not zero */
+    CHECK(parse(&ctx, nal, make_sps_sized(nal, 1, 0, 60, 58)) == SVAC3_OK);
+    CHECK(parse(&ctx, nal, make_sps_sized(nal, 1, 0, 65, 64)) == SVAC3_ERR_INVALID);
+    CHECK(parse(&ctx, nal, make_sps_sized(nal, 1, 0, 64, 65)) == SVAC3_ERR_INVALID);
+    CHECK(parse(&ctx, nal, make_sps_sized(nal, 1, 0, 0, 64)) == SVAC3_ERR_INVALID);
 }
 
 /* ---- tests on real NAL units ---- */
@@ -226,8 +239,6 @@ static void test_real_units(const uint8_t *buf, size_t len)
 
 int main(int argc, char **argv)
 {
-    FILE *f;
-    long len;
     uint8_t *buf;
 
     if (argc != 2) {
@@ -236,20 +247,11 @@ int main(int argc, char **argv)
     }
     test_rpl_and_wq_ranges();
 
-    if (!(f = fopen(argv[1], "rb"))) {
-        perror(argv[1]);
+    size_t len;
+    buf = read_file(argv[1], &len);
+    if (!buf)
         return 1;
-    }
-    fseek(f, 0, SEEK_END);
-    len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    buf = malloc((size_t)len);
-    if (!buf || fread(buf, 1, (size_t)len, f) != (size_t)len) {
-        fprintf(stderr, "cannot read %s\n", argv[1]);
-        return 1;
-    }
-    fclose(f);
-    test_real_units(buf, (size_t)len);
+    test_real_units(buf, len);
     free(buf);
 
     if (failures)

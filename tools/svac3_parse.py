@@ -191,6 +191,10 @@ class Parser:
         f("vertical_size", 14)
         f("pic_width_in_luma", 14)
         f("pic_height_in_luma", 14)
+        if (not s["horizontal_size"] or not s["vertical_size"] or
+                s["horizontal_size"] > s["pic_width_in_luma"] or
+                s["vertical_size"] > s["pic_height_in_luma"]):
+            raise ValueError("display size outside the coded size")
         if s["reference_picture_resampling_enable_flag"]:
             f("rpr_pic_width_in_luma", 14)
             f("rpr_pic_height_in_luma", 14)

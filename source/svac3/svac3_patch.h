@@ -39,7 +39,10 @@ int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
 
 /* As svac3_patch_parse(), and also reconstruct the patch into frame,
  * including deblocking and SAO. Only I pictures are reconstructed so far;
- * for other pictures frame is left untouched. */
+ * for other pictures frame is left untouched. frame must hold the coded
+ * picture in 4:2:0 (SVAC3_ERR_INVALID otherwise). Unlike the parse-only
+ * call, a patch that does not end exactly on its last LCU is an error,
+ * SVAC3_ERR_CORRUPT, and an allocation failure is SVAC3_ERR_NOMEM. */
 int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
                        svac3_frame_t *frame, svac3_patch_stats_t *stats);
 

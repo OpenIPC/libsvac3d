@@ -10,6 +10,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "read_file.h"
 #include "svac3_hls.h"
 #include "svac3_patch.h"
 
@@ -19,15 +20,17 @@ int main(int argc, char **argv)
         fprintf(stderr, "usage: %s stream.svac3 out.yuv\n", argv[0]);
         return 2;
     }
-    FILE *f = fopen(argv[1], "rb"), *o = fopen(argv[2], "wb");
-    if (!f || !o) {
-        perror(!f ? argv[1] : argv[2]);
+    size_t len;
+    uint8_t *buf = read_file(argv[1], &len);
+    if (!buf)
+        return 1;
+    FILE *o = fopen(argv[2], "wb");
+    if (!o) {
+        perror(argv[2]);
+        free(buf);
         return 1;
     }
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t *buf = malloc(len > 0 ? (size_t)len : 1), *rbsp = malloc(len > 0 ? (size_t)len : 1);
+    uint8_t *rbsp = malloc(len ? len : 1);
     svac3_hls_t *hls = calloc(1, sizeof(*hls));
     svac3_frame_t fr;
     uint8_t *planes = NULL;
@@ -35,16 +38,21 @@ int main(int argc, char **argv)
     int rc = 1, pics = 0;
 
     memset(&fr, 0, sizeof(fr));
-    if (!buf || !rbsp || !hls || fread(buf, 1, (size_t)len, f) != (size_t)len)
+    if (!rbsp || !hls)
         goto out;
 
     size_t pos = 0, nal_len;
     const uint8_t *nal;
-    while (svac3_next_nal(buf, (size_t)len, &pos, &nal, &nal_len)) {
+    unsigned idx = 0;
+    while (svac3_next_nal(buf, len, &pos, &nal, &nal_len)) {
+        const unsigned this_idx = idx++;
         if (nal_len < 2)
             continue;
-        if (svac3_parse_nal(hls, nal, nal_len, 0, NULL))
+        int ret = svac3_parse_nal(hls, nal, nal_len, this_idx, NULL);
+        if (ret) {
+            fprintf(stderr, "NAL unit %u: header error %d\n", this_idx, ret);
             goto out;
+        }
         if (!svac3_nal_is_patch(nal[1] & 31u))
             continue;
 
@@ -68,25 +76,34 @@ int main(int argc, char **argv)
 
         svac3_patch_stats_t st;
         size_t rl = svac3_unescape(nal + 2, nal_len - 2, rbsp);
-        int ret = svac3_patch_decode(hls, rbsp, rl, &fr, &st);
+        ret = svac3_patch_decode(hls, rbsp, rl, &fr, &st);
+        if (ret == SVAC3_ERR_CORRUPT) {
+            fprintf(stderr, "picture %d: patch data out of sync from LCU %u, not written\n",
+                    pics, st.first_bad_lcu);
+            goto out;
+        }
         if (ret) {
             fprintf(stderr, "picture %d: decode error %d\n", pics, ret);
             goto out;
         }
-        /* one patch per picture is all that is supported: write it out */
+        /* one patch per picture is all that is supported: write it out. The
+         * SPS parser guarantees the display size lies within the coded size. */
         const int dw = hls->sps.horizontal_size, dh = hls->sps.vertical_size;
         for (int c = 0; c < 3; c++) {
-            const int cw = c ? dw / 2 : dw, ch = c ? dh / 2 : dh;
+            const int cw = c ? (dw + 1) / 2 : dw, ch = c ? (dh + 1) / 2 : dh;
             for (int y = 0; y < ch; y++)
-                fwrite(fr.plane[c] + (size_t)y * fr.stride[c], 1, (size_t)cw, o);
+                if (fwrite(fr.plane[c] + (size_t)y * fr.stride[c], 1, (size_t)cw, o) != (size_t)cw) {
+                    perror(argv[2]);
+                    goto out;
+                }
         }
         pics++;
     }
     fprintf(stderr, "%d pictures\n", pics);
     rc = 0;
 out:
-    fclose(f);
-    fclose(o);
+    if (fclose(o) != 0)
+        rc = 1;
     free(planes);
     free(hls);
     free(rbsp);

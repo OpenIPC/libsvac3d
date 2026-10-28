@@ -36,8 +36,10 @@ typedef struct {
     uint8_t edge_type;           /* edge mode: 0 horizontal, 1 vertical, 2 135 degrees, 3 45 degrees */
 } svac3_sao_t;
 
-/* Apply SAO to the deblocked frame. sao is [lcu][component]. */
-void svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size,
+/* Apply SAO to the deblocked frame. sao is [lcu][component]. Returns 0, or
+ * -1 if a working copy of a plane could not be allocated (frame untouched
+ * from that plane on). */
+int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size,
                int lcu_w, int lcu_h);
 
 #endif /* SVAC3_LOOPFILTER_H */

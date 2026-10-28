@@ -9,6 +9,7 @@
 #include <stdlib.h>
 #include <string.h>
 
+#include "read_file.h"
 #include "svac3_hls.h"
 #include "svac3_patch.h"
 
@@ -20,26 +21,20 @@ int main(int argc, char **argv)
         return 2;
     }
     const char *path = argv[argc - 1];
-    FILE *f = fopen(path, "rb");
-    if (!f) {
-        perror(path);
+    size_t len;
+    uint8_t *buf = read_file(path, &len);
+    if (!buf)
         return 1;
-    }
-    fseek(f, 0, SEEK_END);
-    long len = ftell(f);
-    fseek(f, 0, SEEK_SET);
-    uint8_t *buf = malloc(len > 0 ? (size_t)len : 1), *rbsp = malloc(len > 0 ? (size_t)len : 1);
+    uint8_t *rbsp = malloc(len ? len : 1);
     svac3_hls_t *hls = calloc(1, sizeof(*hls));
     int rc = 1;
-    if (!buf || !rbsp || !hls || fread(buf, 1, (size_t)len, f) != (size_t)len) {
-        fprintf(stderr, "%s: cannot read\n", path);
+    if (!rbsp || !hls)
         goto out;
-    }
 
     size_t pos = 0, nal_len;
     const uint8_t *nal;
     unsigned idx = 0, patches = 0, good = 0, pic = 0;
-    while (svac3_next_nal(buf, (size_t)len, &pos, &nal, &nal_len)) {
+    while (svac3_next_nal(buf, len, &pos, &nal, &nal_len)) {
         if (nal_len >= 2) {
             int t = nal[1] & 31;
             int ret = svac3_parse_nal(hls, nal, nal_len, idx, NULL);
@@ -81,7 +76,6 @@ int main(int argc, char **argv)
     printf("%u/%u patches end exactly on their last LCU\n", good, patches);
     rc = patches && good == patches ? 0 : 1;
 out:
-    fclose(f);
     free(hls);
     free(rbsp);
     free(buf);

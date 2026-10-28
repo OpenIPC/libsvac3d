@@ -146,7 +146,12 @@ static void pred_bilinear(const refs_t *t, uint8_t *p)
     if (M == N) {
         ic = (ia + ib + 1) >> 1;
     } else {
-        const int weight = bilinearWeight[ilog2((M > N ? M : N) / (M < N ? M : N)) - 1];
+        /* ratios 2, 4 and 8; svac3_patch_supported() refuses MaxPartRatio > 8,
+         * as the Main profile requires, so the clamp never changes a result */
+        int wi = ilog2((M > N ? M : N) / (M < N ? M : N)) - 1;
+        if (wi > 2)
+            wi = 2;
+        const int weight = bilinearWeight[wi];
         const int ishift = ilog2(M < N ? M : N);
         ic = (((ia << lM) + (ib << lN)) * weight + (1 << (ishift + 5))) >> (ishift + 6);
     }

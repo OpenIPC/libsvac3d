@@ -185,14 +185,14 @@ void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d)
 /* ------------------------------------------------------------------------ */
 /* SAO, 5.4.12.1 */
 
-void svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size, int lcu_w, int lcu_h)
+int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size, int lcu_w, int lcu_h)
 {
     for (int c = 0; c < 3; c++) {
         const int W = f->width[c], H = f->height[c], s = f->stride[c];
         const int L = c ? lcu_size / 2 : lcu_size;
         uint8_t *src = malloc((size_t)s * H);   /* SAO reads deblocked samples */
         if (!src)
-            return;
+            return -1;
         memcpy(src, f->plane[c], (size_t)s * H);
         uint8_t *dst = f->plane[c];
 
@@ -249,4 +249,5 @@ void svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size, int 
             }
         free(src);
     }
+    return 0;
 }

@@ -863,13 +863,18 @@ static void coding_unit_tree(parser_t *p, int x0, int y0, int split, int w, int 
 
 /* ------------------------------------------------------------------------ */
 
-static void loop_filters(parser_t *p, const svac3_hls_t *hls)
+static int loop_filters(parser_t *p, const svac3_hls_t *hls)
 {
     const size_t n = (size_t)p->scu_stride * ((p->pic_h + 3) / 4);
     uint32_t *id = malloc(n * sizeof(*id));
     uint8_t *qp = malloc(n);
 
-    if (id && qp && !hls->pps.deblocking_filter_disable_flag) {
+    if (!id || !qp) {
+        free(id);
+        free(qp);
+        return SVAC3_ERR_NOMEM;
+    }
+    if (!hls->pps.deblocking_filter_disable_flag) {
         for (size_t i = 0; i < n; i++) {
             id[i] = p->scu[i].cu_id;
             qp[i] = p->scu[i].qp;
@@ -886,7 +891,20 @@ static void loop_filters(parser_t *p, const svac3_hls_t *hls)
     free(id);
     free(qp);
     if (p->sps->sao_enable_flag)
-        svac3_sao(p->frame, (const svac3_sao_t (*)[3])p->sao, p->lcu_size, p->lcu_w, p->lcu_h);
+        return svac3_sao(p->frame, (const svac3_sao_t (*)[3])p->sao, p->lcu_size, p->lcu_w, p->lcu_h)
+               ? SVAC3_ERR_NOMEM : SVAC3_OK;
+    return SVAC3_OK;
+}
+
+/* A frame for reconstruction must hold the coded picture, 4:2:0. */
+static int frame_ok(const svac3_frame_t *f, int w, int h)
+{
+    for (int c = 0; c < 3; c++) {
+        const int pw = c ? w / 2 : w, ph = c ? h / 2 : h;
+        if (!f->plane[c] || f->width[c] != pw || f->height[c] != ph || f->stride[c] < pw)
+            return 0;
+    }
+    return 1;
 }
 
 int svac3_patch_supported(const svac3_hls_t *hls)
@@ -925,6 +943,8 @@ int svac3_patch_supported(const svac3_hls_t *hls)
     if ((s->pic_width_in_luma & 7) || (s->pic_height_in_luma & 7) ||
         !s->pic_width_in_luma || !s->pic_height_in_luma)
         return SVAC3_ERR_INVALID;           /* coded size is a multiple of MiniSize (8) */
+    if (s->log2_max_part_ratio_minus2 > 1)
+        return SVAC3_ERR_INVALID;           /* MaxPartRatio is 8 at most in the Main profile (F.2) */
     if (s->log2_lcu_size_minus2 > 4)
         return SVAC3_ERR_UNSUPPORTED;       /* 128x128 LCUs (transform zero-out not written) */
     (void)p;
@@ -955,7 +975,7 @@ int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
 
     p = calloc(1, sizeof(*p));
     if (!p)
-        return SVAC3_ERR_INVALID;
+        return SVAC3_ERR_NOMEM;
     const svac3_sps_t *s = p->sps = &hls->sps;
     p->pps = &hls->pps;
     p->ph = &hls->ph;
@@ -983,6 +1003,10 @@ int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
         return SVAC3_ERR_INVALID;
     }
     p->num_ref_active0 = (int)ref_minus1 + 1;
+    if (frame && !frame_ok(frame, s->pic_width_in_luma, s->pic_height_in_luma)) {
+        free(p);
+        return SVAC3_ERR_INVALID;
+    }
     p->frame = frame;
     p->recon = frame != NULL && p->pct == 1;
     p->mipf = s->mipf_enable_flag;
@@ -994,7 +1018,7 @@ int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
     p->scu = calloc((size_t)p->scu_stride * ((p->pic_h + 3) / 4), sizeof(scu_t));
     if (!p->scu) {
         free(p);
-        return SVAC3_ERR_INVALID;
+        return SVAC3_ERR_NOMEM;
     }
 
     /* a single patch covering the picture */
@@ -1011,7 +1035,7 @@ int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
         if (!p->sao) {
             free(p->scu);
             free(p);
-            return SVAC3_ERR_INVALID;
+            return SVAC3_ERR_NOMEM;
         }
     }
     svac3_ctx_init(p->ctx, SVAC3_NUM_CTX);
@@ -1062,10 +1086,16 @@ int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
     st->bytes_used = svac3_aec_bytes_read(&p->aec);
     st->overrun_bits = p->aec.overrun;
 
-    if (p->recon && st->stuffing_ok)
-        loop_filters(p, hls);
+    ret = SVAC3_OK;
+    if (p->frame) {
+        /* a picture that did not parse to its exact end is not a picture */
+        if (!st->stuffing_ok || st->overrun_bits)
+            ret = SVAC3_ERR_CORRUPT;
+        else if (p->recon)
+            ret = loop_filters(p, hls);
+    }
     free(p->sao);
     free(p->scu);
     free(p);
-    return SVAC3_OK;
+    return ret;
 }
