@@ -120,14 +120,21 @@ class Parser:
         else:
             r["reference_to_library_enable_flag"] = 0
         n = b.ue()
+        if n > sps["max_dpb_size_minus1"] or n > 17:
+            raise ValueError("num_of_ref_pic shall be less than MaxDpbSize")
         r["num_of_ref_pic"] = n
         deltas = []
         for i in range(n):
             lib = b.u(1) if r["reference_to_library_enable_flag"] else 0
             if lib:
-                deltas.append(f"L{b.ue()}")
+                li = b.ue()
+                if li > 511:
+                    raise ValueError("referenced_library_picture_index out of range")
+                deltas.append(f"L{li}")
             else:
                 a = b.ue()
+                if a > 255:
+                    raise ValueError("abs_delta_doi out of range")
                 s = b.u(1) if a > 0 else 0
                 deltas.append(-a if s else a)
         r["delta_doi"] = deltas
@@ -138,6 +145,8 @@ class Parser:
     # 表15
     def wq_matrix(self, b, prefix):
         m = [b.ue() for _ in range(16 + 64)]
+        if any(c < 1 or c > 255 for c in m):
+            raise ValueError("weight_quant_coeff out of range 1..255")
         self.emit(f"{prefix}.weight_quant_matrix", ",".join(map(str, m)))
 
     # 表13
@@ -508,7 +517,10 @@ class Parser:
         else:
             e("payload_bytes", len(b.d))
             return
-        e("rbsp_trailing_bits", "ok" if b.trailing_ok() else "BAD")
+        ok = b.trailing_ok()
+        e("rbsp_trailing_bits", "ok" if ok else "BAD")
+        if not ok:
+            raise ValueError("malformed rbsp_trailing_bits")
 
 
 def main():

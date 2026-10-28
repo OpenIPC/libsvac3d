@@ -174,16 +174,22 @@ static int parse_rpl(bits_t *b, const svac3_sps_t *s, svac3_rpl_t *r,
     if (s->library_picture_enable_flag && !s->library_stream_flag)
         r->reference_to_library_enable_flag = rd_u(b, 1);
     uint32_t n = rd_ue(b);
-    if (n > SVAC3_MAX_REFS)
-        return SVAC3_ERR_INVALID;
+    /* num_of_ref_pic shall be less than MaxDpbSize */
+    if (b->err || n > s->max_dpb_size_minus1 || n > SVAC3_MAX_REFS)
+        return b->err ? b->err : SVAC3_ERR_INVALID;
     r->num_of_ref_pic = n;
     for (uint32_t i = 0; i < n; i++) {
         if (r->reference_to_library_enable_flag)
             r->library_index_flag[i] = rd_u(b, 1);
         if (r->library_index_flag[i]) {
-            r->delta_doi[i] = (int32_t)rd_ue(b);
+            uint32_t li = rd_ue(b);
+            if (li > 511)        /* referenced_library_picture_index: 0..511 */
+                return b->err ? b->err : SVAC3_ERR_INVALID;
+            r->delta_doi[i] = (int32_t)li;
         } else {
             uint32_t a = rd_ue(b);
+            if (a > 255)         /* abs_delta_doi: 0..2^8-1 */
+                return b->err ? b->err : SVAC3_ERR_INVALID;
             int sign = a > 0 ? rd_u(b, 1) : 0;
             r->delta_doi[i] = sign ? -(int32_t)a : (int32_t)a;
         }
@@ -194,13 +200,19 @@ static int parse_rpl(bits_t *b, const svac3_sps_t *s, svac3_rpl_t *r,
     return b->err;
 }
 
-static void parse_wq_matrix(bits_t *b, uint8_t m4[16], uint8_t m8[64],
-                            const char *prefix, FILE *dump)
+static int parse_wq_matrix(bits_t *b, uint8_t m4[16], uint8_t m8[64],
+                           const char *prefix, FILE *dump)
 {
     int32_t v[80];
 
-    for (int i = 0; i < 80; i++)
-        v[i] = (int32_t)rd_ue(b);
+    for (int i = 0; i < 80; i++) {
+        uint32_t c = rd_ue(b);
+        if (b->err)
+            return b->err;
+        if (c < 1 || c > 255)    /* weight_quant_coeff: 1..255 */
+            return SVAC3_ERR_INVALID;
+        v[i] = (int32_t)c;
+    }
     for (int i = 0; i < 16; i++)
         m4[i] = (uint8_t)v[i];
     for (int i = 0; i < 64; i++)
@@ -210,6 +222,7 @@ static void parse_wq_matrix(bits_t *b, uint8_t m4[16], uint8_t m8[64],
         snprintf(key, sizeof(key), "%s.weight_quant_matrix", prefix);
         dump_list(dump, key, v, 80, NULL);
     }
+    return SVAC3_OK;
 }
 
 /* ------------------------------------------------------------------------ */
@@ -306,8 +319,9 @@ static int parse_sps(bits_t *b, svac3_sps_t *s, FILE *dump)
     F(s->weight_quant_enable_flag, "weight_quant_enable_flag", 1);
     if (s->weight_quant_enable_flag) {
         F(s->load_seq_weight_quant_data_flag, "load_seq_weight_quant_data_flag", 1);
-        if (s->load_seq_weight_quant_data_flag)
-            parse_wq_matrix(b, s->wq_matrix4x4, s->wq_matrix8x8, "sps", dump);
+        if (s->load_seq_weight_quant_data_flag &&
+            (ret = parse_wq_matrix(b, s->wq_matrix4x4, s->wq_matrix8x8, "sps", dump)))
+            return ret;
     }
     F(s->st_enable_flag, "st_enable_flag", 1);
     F(s->sao_enable_flag, "sao_enable_flag", 1);
@@ -430,7 +444,9 @@ static int parse_pps(bits_t *b, const svac3_sps_t *s, svac3_pps_t *p, FILE *dump
                     dump_list(dump, key, p->weight_quant_param_delta, 6, NULL);
                 }
             } else if (p->picture_weight_quant_data_index == 2) {
-                parse_wq_matrix(b, p->wq_matrix4x4, p->wq_matrix8x8, "pps", dump);
+                int ret = parse_wq_matrix(b, p->wq_matrix4x4, p->wq_matrix8x8, "pps", dump);
+                if (ret)
+                    return ret;
             }
         }
     }
@@ -659,6 +675,25 @@ int svac3_parse_nal(svac3_hls_t *ctx, const uint8_t *nal, size_t len,
     E("layer_id=%u", nh.layer_id);
     E("temporal_id=%u", nh.temporal_id);
     E("nal_unit_type=%u", nh.nal_unit_type);
+    /* A parameter set or picture header invalidates everything that depends
+     * on its predecessor before it is parsed, so a failure, a malformed
+     * trailer or an encrypted payload never leaves stale state behind. */
+    switch (nh.nal_unit_type) {
+    case SVAC3_NAL_SPS:
+        ctx->have_sps = 0;
+        /* fall through */
+    case SVAC3_NAL_PPS:
+        ctx->have_pps = 0;
+        /* fall through */
+    case SVAC3_NAL_PIC_HEAD:
+        ctx->have_ph = 0;
+        ctx->have_patch = 0;
+        break;
+    default:
+        if (is_patch(nh.nal_unit_type))
+            ctx->have_patch = 0;
+        break;
+    }
     if (nh.encryption_idc) {
         E("payload=%s", "encrypted (not parsed)");
         return SVAC3_OK;
@@ -670,11 +705,11 @@ int svac3_parse_nal(svac3_hls_t *ctx, const uint8_t *nal, size_t len,
     rbsp_len = svac3_unescape(nal + 2, len - 2, rbsp);
     bits_init(b, rbsp, rbsp_len);
 
+    int *valid = NULL;
     switch (nh.nal_unit_type) {
     case SVAC3_NAL_SPS:
         ret = parse_sps(b, &ctx->sps, dump);
-        ctx->have_sps = ret == SVAC3_OK;
-        ctx->have_pps = ctx->have_ph = 0;
+        valid = &ctx->have_sps;
         break;
     case SVAC3_NAL_PPS:
         if (!ctx->have_sps) {
@@ -682,7 +717,7 @@ int svac3_parse_nal(svac3_hls_t *ctx, const uint8_t *nal, size_t len,
             break;
         }
         ret = parse_pps(b, &ctx->sps, &ctx->pps, dump);
-        ctx->have_pps = ret == SVAC3_OK;
+        valid = &ctx->have_pps;
         break;
     case SVAC3_NAL_PIC_HEAD:
         if (!ctx->have_sps || !ctx->have_pps) {
@@ -690,16 +725,16 @@ int svac3_parse_nal(svac3_hls_t *ctx, const uint8_t *nal, size_t len,
             break;
         }
         ret = parse_ph(b, &ctx->sps, &ctx->pps, &ctx->ph, dump);
-        ctx->have_ph = ret == SVAC3_OK;
+        valid = &ctx->have_ph;
         break;
     default:
         if (is_patch(nh.nal_unit_type)) {
-            svac3_patch_header_t ph;
             if (!ctx->have_ph) {
                 ret = SVAC3_ERR_INVALID;
                 break;
             }
-            ret = parse_patch_header(b, &ctx->sps, &ctx->pps, &ph, dump);
+            ret = parse_patch_header(b, &ctx->sps, &ctx->pps, &ctx->patch, dump);
+            ctx->have_patch = ret == SVAC3_OK;
         } else {
             E("payload_bytes=%zu", rbsp_len);
         }
@@ -707,8 +742,14 @@ int svac3_parse_nal(svac3_hls_t *ctx, const uint8_t *nal, size_t len,
         return ret;  /* no RBSP trailing check: AEC data or unparsed payload */
     }
 
-    if (ret == SVAC3_OK)
-        E("rbsp_trailing_bits=%s", trailing_ok(b) ? "ok" : "BAD");
+    if (ret == SVAC3_OK) {
+        int ok = trailing_ok(b);
+        E("rbsp_trailing_bits=%s", ok ? "ok" : "BAD");
+        if (!ok)
+            ret = SVAC3_ERR_INVALID;
+    }
+    if (valid)
+        *valid = ret == SVAC3_OK;
     free(rbsp);
     return ret;
 }

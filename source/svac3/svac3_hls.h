@@ -169,11 +169,16 @@ typedef struct {
     size_t  aec_data_offset;                 /* byte offset of the AEC data in the RBSP */
 } svac3_patch_header_t;
 
+/* Parser state. Each have_* flag is set only after its structure parsed
+ * cleanly, and is cleared as soon as a NAL unit that replaces it, or one it
+ * depends on, arrives: an SPS clears the PPS, picture header and patch
+ * header; a PPS clears the picture and patch headers. */
 typedef struct {
     svac3_sps_t sps;
     svac3_pps_t pps;
     svac3_ph_t  ph;
-    int have_sps, have_pps, have_ph;
+    svac3_patch_header_t patch;              /* last patch header parsed */
+    int have_sps, have_pps, have_ph, have_patch;
 } svac3_hls_t;
 
 /* Annex-B: find the next NAL unit at or after *pos. Returns 1 with nal and
