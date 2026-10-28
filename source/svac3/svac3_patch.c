@@ -1158,6 +1158,8 @@ int svac3_patch_supported(const svac3_hls_t *hls)
                t == SVAC3_NAL_IDR_PATCH || t == SVAC3_NAL_RL_PATCH) {
         if (s->library_stream_flag)
             return SVAC3_ERR_INVALID;       /* a display patch in a library stream */
+        if (t == SVAC3_NAL_RL_PATCH && hls->ph.picture_coding_type == 1)
+            return SVAC3_ERR_INVALID;       /* an RL picture references a library picture */
     } else {
         return SVAC3_ERR_UNSUPPORTED;
     }

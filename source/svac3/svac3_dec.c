@@ -12,8 +12,9 @@
 
 /* every reference a list may name, plus the picture being decoded */
 #define DPB_SLOTS (2 * SVAC3_MAX_REFS + 1)
-/* library pictures kept, by library_picture_index, plus one being decoded */
-#define LIB_SLOTS 5
+/* the library picture kept (the Main profile allows one in the buffer,
+ * F.2; a new one replaces it, 5.4.3.4), and one being decoded */
+#define LIB_SLOTS 2
 
 typedef struct {
     uint8_t *buf;
@@ -23,7 +24,6 @@ typedef struct {
     int64_t poi;
     int used;
     uint32_t lib_index;      /* library pictures: library_picture_index */
-    uint64_t age;            /* library pictures: when decoded */
 } pic_t;
 
 struct svac3_dec {
@@ -33,7 +33,6 @@ struct svac3_dec {
     size_t rbsp_cap;
     pic_t pic[DPB_SLOTS];
     pic_t lib[LIB_SLOTS];
-    uint64_t lib_clock;
     int w, h;
     int64_t cycle;
     int doi_prev, have_prev;
@@ -173,11 +172,12 @@ static int64_t clamp_dist(int64_t dist)
     return dist < -32768 ? -32768 : dist > 32767 ? 32767 : dist;
 }
 
-/* A library picture (library_stream_flag 1): an I picture kept by its
- * library_picture_index for display pictures to reference, and output
- * since only display library patches (type 17) are accepted. */
-static int decode_library(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
-                          const svac3_frame_t **out)
+/* A library picture (library_stream_flag 1): an I picture kept, with its
+ * library_picture_index, for display pictures to reference, and output
+ * since only display library patches (type 17) are accepted. A display
+ * picture naming another index finds no reference. */
+static int decode_library(svac3_dec_t *d, const uint8_t *rbsp, size_t rl, int64_t doi,
+                          int64_t poi, const svac3_frame_t **out)
 {
     svac3_hls_t *hls = &d->hls;
     const uint32_t index = hls->ph.library_picture_index;
@@ -186,28 +186,22 @@ static int decode_library(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
     if (hls->ph.picture_coding_type != 1)
         return SVAC3_ERR_UNSUPPORTED;           /* inter-coded library pictures */
 
-    /* a free slot, else the oldest that is not this index's current one */
-    pic_t *cur = NULL, *old = find_lib(d, index);
-    for (int i = 0; i < LIB_SLOTS && !cur; i++)
-        if (!d->lib[i].used)
-            cur = &d->lib[i];
-    for (int i = 0; i < LIB_SLOTS && (!cur || cur->used); i++)
-        if (&d->lib[i] != old && (!cur || d->lib[i].age < cur->age))
-            cur = &d->lib[i];
-    if (!cur)
-        return SVAC3_ERR_CORRUPT;               /* cannot happen: LIB_SLOTS > 1 */
+    /* decode into the slot not holding the current library picture, which
+     * gives way only once the new one has decoded */
+    pic_t *cur = d->lib[0].used ? &d->lib[1] : &d->lib[0];
     cur->used = 0;
     if (!cur->buf && (ret = alloc_pic(cur, d->w, d->h)))
         return ret;
     ret = svac3_patch_decode(hls, rbsp, rl, &cur->f, NULL, cur->tmv, &d->st);
     if (ret)
         return ret;
-    if (old)
-        old->used = 0;
+    for (int i = 0; i < LIB_SLOTS; i++)
+        d->lib[i].used = 0;
     cur->used = 1;
     cur->lib_index = index;
-    cur->age = ++d->lib_clock;
-    cur->doi = cur->poi = 0;
+    cur->doi = doi;
+    cur->poi = poi;
+    d->last_poi = poi;
     *out = &cur->f;
     return SVAC3_OK;
 }
@@ -236,10 +230,10 @@ static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
         d->doi_prev = doi7;
         d->have_prev = 1;
     }
-    if (sps->library_stream_flag)
-        return decode_library(d, rbsp, rl, out);
     const int64_t doi = doi7 + 256 * d->cycle;
     const int64_t poi = doi + hls->ph.picture_output_delay;
+    if (sps->library_stream_flag)
+        return decode_library(d, rbsp, rl, doi, poi, out);
 
     /* reference lists, and the pictures either of them keeps */
     ref_t list[2][SVAC3_MAX_REFS];

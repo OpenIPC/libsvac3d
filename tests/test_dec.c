@@ -64,8 +64,29 @@ static void library_checks(const unit_t *u, int n)
         return;
 
     svac3_dec_t *d = svac3_dec_create();
-    int pics = 0;
-    CHECK(feed(d, u, 0, n, &pics) == 0 && pics == patches);
+    int pics = 0, rising = 1;
+    int64_t poi = -1;
+    for (int i = 0; i < n; i++) {
+        const svac3_frame_t *f;
+        CHECK(svac3_dec_nal(d, u[i].p, u[i].len, &f) == 0);
+        if (!f)
+            continue;
+        pics++;
+        /* library pictures too: output order follows decoding order */
+        rising &= svac3_dec_poi(d) > poi;
+        poi = svac3_dec_poi(d);
+    }
+    CHECK(pics == patches && rising);
+
+    /* an RL picture is a P picture: one coded as I is refused */
+    svac3_dec_reset(d);
+    pics = 0;
+    CHECK(feed(d, u, 0, rl + 1, &pics) == 0);
+    static svac3_hls_t h;
+    h = *svac3_dec_hls(d);
+    CHECK(h.patch.nal_unit_type == SVAC3_NAL_RL_PATCH && svac3_patch_supported(&h) == SVAC3_OK);
+    h.ph.picture_coding_type = 1;
+    CHECK(svac3_patch_supported(&h) == SVAC3_ERR_INVALID);
 
     svac3_dec_reset(d);
     pics = 0;

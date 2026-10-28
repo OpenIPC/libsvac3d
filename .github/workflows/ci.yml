@@ -86,6 +86,7 @@ jobs:
         run: |
           for g in tests/golden/*.framemd5; do
             s="tests/streams/$(basename "$g" .framemd5).svac3"
-            ffbuild/ffmpeg -hide_banner -loglevel warning -i "$s" -f framemd5 out.framemd5
+            rm -f out.framemd5
+            ffbuild/ffmpeg -y -hide_banner -loglevel warning -i "$s" -f framemd5 out.framemd5
             python3 ffmpeg/check_framemd5.py "$g" out.framemd5
           done
