@@ -28,6 +28,9 @@ void svac3_dec_destroy(svac3_dec_t *d);
  * decoding starts after the I picture. */
 int svac3_dec_nal(svac3_dec_t *d, const uint8_t *nal, size_t len, const svac3_frame_t **out);
 
+/* Drop every decoded picture (after a seek); parameter sets are kept */
+void svac3_dec_reset(svac3_dec_t *d);
+
 const svac3_hls_t *svac3_dec_hls(const svac3_dec_t *d);
 
 /* Statistics of the last patch decoded */

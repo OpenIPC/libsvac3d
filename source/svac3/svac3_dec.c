@@ -55,6 +55,13 @@ void svac3_dec_destroy(svac3_dec_t *d)
     free(d);
 }
 
+void svac3_dec_reset(svac3_dec_t *d)
+{
+    for (int i = 0; i < DPB_SLOTS; i++)
+        d->pic[i].used = 0;
+    d->have_prev = 0;
+}
+
 const svac3_hls_t *svac3_dec_hls(const svac3_dec_t *d)
 {
     return &d->hls;
@@ -159,13 +166,15 @@ static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
         if (nlist[l] < 0)
             return SVAC3_ERR_UNSUPPORTED;       /* library pictures */
     }
+    /* which pictures the lists keep; the buffer is pruned only once the
+     * picture has decoded, so a rejected one costs no reference */
+    int keep[DPB_SLOTS];
     for (int i = 0; i < DPB_SLOTS; i++) {
-        pic_t *p = &d->pic[i];
-        int keep = 0;
+        const pic_t *p = &d->pic[i];
+        keep[i] = 0;
         for (int l = 0; l < 2; l++)
             for (int j = 0; j < nlist[l]; j++)
-                keep |= p->used && p->doi == list[l][j];
-        p->used = keep;
+                keep[i] |= p->used && p->doi == list[l][j];
     }
 
     svac3_refs_t refs;
@@ -185,18 +194,26 @@ static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
         }
     }
 
+    /* a free slot, or failing that one the lists let go: at most
+     * 2 * SVAC3_MAX_REFS are kept, so one always exists */
     pic_t *cur = NULL;
     for (int i = 0; i < DPB_SLOTS && !cur; i++)
         if (!d->pic[i].used)
             cur = &d->pic[i];
+    for (int i = 0; i < DPB_SLOTS && !cur; i++)
+        if (!keep[i])
+            cur = &d->pic[i];
     if (!cur)
-        return SVAC3_ERR_CORRUPT;               /* cannot happen: lists are bounded */
+        return SVAC3_ERR_CORRUPT;
+    cur->used = 0;                              /* its picture is about to be overwritten */
     if (!cur->buf && (ret = alloc_pic(cur, w, h)))
         return ret;
 
     ret = svac3_patch_decode(hls, rbsp, rl, &cur->f, &refs, cur->tmv, &d->st);
     if (ret)
         return ret;
+    for (int i = 0; i < DPB_SLOTS; i++)
+        d->pic[i].used = keep[i];
     cur->used = 1;
     cur->doi = doi;
     cur->poi = poi;
