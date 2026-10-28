@@ -703,8 +703,13 @@ int svac3_patch_supported(const svac3_hls_t *hls)
     const svac3_sps_t *s = &hls->sps;
     const svac3_pps_t *p = &hls->pps;
 
-    if (!hls->have_sps || !hls->have_pps || !hls->have_ph)
+    if (!hls->have_sps || !hls->have_pps || !hls->have_ph || !hls->have_patch)
         return SVAC3_ERR_INVALID;
+    /* patches of display pictures only: no library, crossed or privacy patches */
+    if (hls->patch.nal_unit_type != SVAC3_NAL_NRAP_PATCH &&
+        hls->patch.nal_unit_type != SVAC3_NAL_RAPI_PATCH &&
+        hls->patch.nal_unit_type != SVAC3_NAL_IDR_PATCH)
+        return SVAC3_ERR_UNSUPPORTED;
     if (s->profile_id != 0x30 || s->chroma_format != 1 || s->sample_precision != 1)
         return SVAC3_ERR_UNSUPPORTED;
     if (s->library_picture_enable_flag || s->weight_quant_enable_flag ||
@@ -728,6 +733,8 @@ int svac3_patch_supported(const svac3_hls_t *hls)
     (void)p;
     if (hls->ph.picture_coding_type == 3)
         return SVAC3_ERR_UNSUPPORTED;       /* B pictures */
+    if (hls->ph.picture_coding_type != 1 && hls->ph.picture_coding_type != 2)
+        return SVAC3_ERR_INVALID;           /* 0 is reserved */
     return SVAC3_OK;
 }
 
@@ -765,9 +772,14 @@ int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
     p->fixed_qp = hls->pps.fixed_picture_qp_flag ? 1 : hls->patch.fixed_patch_qp_flag;
     p->cu_delta_qp_flag = hls->pps.cu_delta_qp_flag;
     p->qp_group_area = 1 << ((hls->pps.cu_qp_group_size_log2_minus3 + 3) * 2);
-    p->num_ref_active0 = hls->ph.num_ref_active_override_flag
-                         ? (int)hls->ph.num_ref_active_minus1[0] + 1
-                         : (int)s->num_ref_default_active_minus1[0] + 1;
+    const uint32_t ref_minus1 = hls->ph.num_ref_active_override_flag
+                                ? hls->ph.num_ref_active_minus1[0]
+                                : s->num_ref_default_active_minus1[0];
+    if (ref_minus1 >= SVAC3_MAX_REFS) {
+        free(p);
+        return SVAC3_ERR_INVALID;
+    }
+    p->num_ref_active0 = (int)ref_minus1 + 1;
     p->scu_stride = (p->pic_w + 3) / 4;
     p->scu = calloc((size_t)p->scu_stride * ((p->pic_h + 3) / 4), sizeof(scu_t));
     if (!p->scu) {
@@ -776,8 +788,9 @@ int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
     }
 
     /* a single patch covering the picture */
-    const int patch_w = (int)s->patch_width_minus1 + 1, patch_h = (int)s->patch_height_minus1 + 1;
-    if (patch_w < p->lcu_w || patch_h < p->lcu_h || hls->patch.patch_index != 0) {
+    if ((uint64_t)s->patch_width_minus1 + 1 < (uint64_t)p->lcu_w ||
+        (uint64_t)s->patch_height_minus1 + 1 < (uint64_t)p->lcu_h ||
+        hls->patch.patch_index != 0) {
         free(p->scu);
         free(p);
         return SVAC3_ERR_UNSUPPORTED;       /* several patches per picture */

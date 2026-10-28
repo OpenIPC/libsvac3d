@@ -651,7 +651,7 @@ static const char *nal_name(unsigned t)
     return t < sizeof(names) / sizeof(names[0]) && names[t] ? names[t] : "RESERVED";
 }
 
-static int is_patch(unsigned t)
+int svac3_nal_is_patch(unsigned t)
 {
     return t == 1 || t == 2 || t == 4 || t == 12 || t == 14 || t == 17 || t == 18 || t == 19;
 }
@@ -690,7 +690,7 @@ int svac3_parse_nal(svac3_hls_t *ctx, const uint8_t *nal, size_t len,
         ctx->have_patch = 0;
         break;
     default:
-        if (is_patch(nh.nal_unit_type))
+        if (svac3_nal_is_patch(nh.nal_unit_type))
             ctx->have_patch = 0;
         break;
     }
@@ -728,12 +728,13 @@ int svac3_parse_nal(svac3_hls_t *ctx, const uint8_t *nal, size_t len,
         valid = &ctx->have_ph;
         break;
     default:
-        if (is_patch(nh.nal_unit_type)) {
+        if (svac3_nal_is_patch(nh.nal_unit_type)) {
             if (!ctx->have_ph) {
                 ret = SVAC3_ERR_INVALID;
                 break;
             }
             ret = parse_patch_header(b, &ctx->sps, &ctx->pps, &ctx->patch, dump);
+            ctx->patch.nal_unit_type = nh.nal_unit_type;
             ctx->have_patch = ret == SVAC3_OK;
         } else {
             E("payload_bytes=%zu", rbsp_len);

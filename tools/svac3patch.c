@@ -49,7 +49,7 @@ int main(int argc, char **argv)
             }
             if (t == SVAC3_NAL_PIC_HEAD)
                 pic++;
-            if (t == 1 || t == 2 || t == 4) {
+            if (svac3_nal_is_patch((unsigned)t)) {
                 svac3_patch_stats_t st;
                 size_t rl = svac3_unescape(nal + 2, nal_len - 2, rbsp);
                 ret = svac3_patch_parse(hls, rbsp, rl, &st);

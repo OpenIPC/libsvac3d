@@ -24,7 +24,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         return 0;
     memset(&hls, 0, sizeof(hls));
     while (svac3_next_nal(data, size, &pos, &nal, &nal_len)) {
-        if (nal_len < 2 || svac3_parse_nal(&hls, nal, nal_len, 0, NULL) || !hls.have_patch)
+        if (nal_len < 2 || svac3_parse_nal(&hls, nal, nal_len, 0, NULL))
+            continue;
+        if (!svac3_nal_is_patch(nal[1] & 31u) || !hls.have_patch)
             continue;
         /* keep the fuzzer fast: bound the picture it may describe */
         if ((size_t)hls.sps.pic_width_in_luma * hls.sps.pic_height_in_luma > 1920 * 1088)
