@@ -2,7 +2,8 @@
  * Copyright (c) 2026 OpenIPC contributors
  *
  * SVAC3 picture decoder around the patch decoder: 5.4.3.2 (DOI and POI),
- * 5.4.3.3 (reference picture lists) and the decoded picture buffer.
+ * 5.4.3.3 (reference picture lists), the decoded picture buffer, and the
+ * library pictures that display pictures may reference.
  */
 #include "svac3_dec.h"
 
@@ -11,6 +12,8 @@
 
 /* every reference a list may name, plus the picture being decoded */
 #define DPB_SLOTS (2 * SVAC3_MAX_REFS + 1)
+/* library pictures kept, by library_picture_index, plus one being decoded */
+#define LIB_SLOTS 5
 
 typedef struct {
     uint8_t *buf;
@@ -19,6 +22,8 @@ typedef struct {
     int64_t doi;             /* DOI + 256 * DOICycleCnt */
     int64_t poi;
     int used;
+    uint32_t lib_index;      /* library pictures: library_picture_index */
+    uint64_t age;            /* library pictures: when decoded */
 } pic_t;
 
 struct svac3_dec {
@@ -27,6 +32,8 @@ struct svac3_dec {
     uint8_t *rbsp;
     size_t rbsp_cap;
     pic_t pic[DPB_SLOTS];
+    pic_t lib[LIB_SLOTS];
+    uint64_t lib_clock;
     int w, h;
     int64_t cycle;
     int doi_prev, have_prev;
@@ -38,13 +45,19 @@ svac3_dec_t *svac3_dec_create(void)
     return calloc(1, sizeof(svac3_dec_t));
 }
 
+static void free_pic(pic_t *p)
+{
+    free(p->buf);
+    free(p->tmv);
+    memset(p, 0, sizeof(*p));
+}
+
 static void free_pics(svac3_dec_t *d)
 {
-    for (int i = 0; i < DPB_SLOTS; i++) {
-        free(d->pic[i].buf);
-        free(d->pic[i].tmv);
-        memset(&d->pic[i], 0, sizeof(d->pic[i]));
-    }
+    for (int i = 0; i < DPB_SLOTS; i++)
+        free_pic(&d->pic[i]);
+    for (int i = 0; i < LIB_SLOTS; i++)
+        free_pic(&d->lib[i]);
 }
 
 void svac3_dec_destroy(svac3_dec_t *d)
@@ -60,6 +73,8 @@ void svac3_dec_reset(svac3_dec_t *d)
 {
     for (int i = 0; i < DPB_SLOTS; i++)
         d->pic[i].used = 0;
+    for (int i = 0; i < LIB_SLOTS; i++)
+        d->lib[i].used = 0;
     d->have_prev = 0;
 }
 
@@ -122,55 +137,118 @@ static const svac3_rpl_t *rpl_of(const svac3_hls_t *hls, int l)
     return &s->rpls[l][idx];
 }
 
-/* 5.4.3.3: RefPicDoiList for list l; returns the number of entries, or -1
- * for a list naming a library picture */
-static int ref_dois(const svac3_rpl_t *r, int64_t doi, int64_t out[SVAC3_MAX_REFS])
+typedef struct {
+    int lib;                 /* a library picture, by index */
+    int64_t key;             /* its DOI, or its library_picture_index */
+} ref_t;
+
+/* 5.4.3.3: RefPicDoiList for list l; returns the number of entries */
+static int ref_list(const svac3_rpl_t *r, int64_t doi, ref_t out[SVAC3_MAX_REFS])
 {
     int64_t base = doi;
     const int n = r->num_of_ref_pic < SVAC3_MAX_REFS ? r->num_of_ref_pic : SVAC3_MAX_REFS;
     for (int j = 0; j < n; j++) {
-        if (r->library_index_flag[j])
-            return -1;
-        base -= r->delta_doi[j];
-        out[j] = base;
+        out[j].lib = r->library_index_flag[j];
+        if (out[j].lib) {
+            out[j].key = r->delta_doi[j];   /* ReferencedLibraryPictureIndex */
+        } else {
+            base -= r->delta_doi[j];
+            out[j].key = base;
+        }
     }
     return n;
+}
+
+static pic_t *find_lib(svac3_dec_t *d, int64_t index)
+{
+    for (int i = 0; i < LIB_SLOTS; i++)
+        if (d->lib[i].used && d->lib[i].lib_index == index)
+            return &d->lib[i];
+    return NULL;
+}
+
+static int64_t clamp_dist(int64_t dist)
+{
+    /* bounded for a conforming stream (POIs within 128); clamp a corrupt one */
+    return dist < -32768 ? -32768 : dist > 32767 ? 32767 : dist;
+}
+
+/* A library picture (library_stream_flag 1): an I picture kept by its
+ * library_picture_index for display pictures to reference, and output
+ * since only display library patches (type 17) are accepted. */
+static int decode_library(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
+                          const svac3_frame_t **out)
+{
+    svac3_hls_t *hls = &d->hls;
+    const uint32_t index = hls->ph.library_picture_index;
+    int ret;
+
+    if (hls->ph.picture_coding_type != 1)
+        return SVAC3_ERR_UNSUPPORTED;           /* inter-coded library pictures */
+
+    /* a free slot, else the oldest that is not this index's current one */
+    pic_t *cur = NULL, *old = find_lib(d, index);
+    for (int i = 0; i < LIB_SLOTS && !cur; i++)
+        if (!d->lib[i].used)
+            cur = &d->lib[i];
+    for (int i = 0; i < LIB_SLOTS && (!cur || cur->used); i++)
+        if (&d->lib[i] != old && (!cur || d->lib[i].age < cur->age))
+            cur = &d->lib[i];
+    if (!cur)
+        return SVAC3_ERR_CORRUPT;               /* cannot happen: LIB_SLOTS > 1 */
+    cur->used = 0;
+    if (!cur->buf && (ret = alloc_pic(cur, d->w, d->h)))
+        return ret;
+    ret = svac3_patch_decode(hls, rbsp, rl, &cur->f, NULL, cur->tmv, &d->st);
+    if (ret)
+        return ret;
+    if (old)
+        old->used = 0;
+    cur->used = 1;
+    cur->lib_index = index;
+    cur->age = ++d->lib_clock;
+    cur->doi = cur->poi = 0;
+    *out = &cur->f;
+    return SVAC3_OK;
 }
 
 static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
                           const svac3_frame_t **out)
 {
     svac3_hls_t *hls = &d->hls;
+    const svac3_sps_t *sps = &hls->sps;
     int ret = svac3_patch_supported(hls);
     if (ret)
         return ret;
 
-    const int w = hls->sps.pic_width_in_luma, h = hls->sps.pic_height_in_luma;
+    const int w = sps->pic_width_in_luma, h = sps->pic_height_in_luma;
     if (w != d->w || h != d->h) {
         free_pics(d);
         d->w = w;
         d->h = h;
     }
 
-    /* 5.4.3.2 */
+    /* 5.4.3.2: a library stream's DOIs count only in library picture mode 1 */
     const int doi7 = hls->ph.decode_order_index;
-    if (d->have_prev && doi7 < d->doi_prev)
-        d->cycle++;
-    d->doi_prev = doi7;
-    d->have_prev = 1;
+    if (!sps->library_stream_flag || sps->library_picture_mode_index == 1) {
+        if (d->have_prev && doi7 < d->doi_prev)
+            d->cycle++;
+        d->doi_prev = doi7;
+        d->have_prev = 1;
+    }
+    if (sps->library_stream_flag)
+        return decode_library(d, rbsp, rl, out);
     const int64_t doi = doi7 + 256 * d->cycle;
     const int64_t poi = doi + hls->ph.picture_output_delay;
 
     /* reference lists, and the pictures either of them keeps */
-    int64_t list[2][SVAC3_MAX_REFS];
+    ref_t list[2][SVAC3_MAX_REFS];
     int nlist[2];
     for (int l = 0; l < 2; l++) {
         const svac3_rpl_t *r = rpl_of(hls, l);
         if (!r)
             return SVAC3_ERR_CORRUPT;
-        nlist[l] = ref_dois(r, doi, list[l]);
-        if (nlist[l] < 0)
-            return SVAC3_ERR_UNSUPPORTED;       /* library pictures */
+        nlist[l] = ref_list(r, doi, list[l]);
     }
     /* which pictures the lists keep; the buffer is pruned only once the
      * picture has decoded, so a rejected one costs no reference */
@@ -180,7 +258,7 @@ static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
         keep[i] = 0;
         for (int l = 0; l < 2; l++)
             for (int j = 0; j < nlist[l]; j++)
-                keep[i] |= p->used && p->doi == list[l][j];
+                keep[i] |= p->used && !list[l][j].lib && p->doi == list[l][j].key;
     }
 
     svac3_refs_t refs;
@@ -188,13 +266,13 @@ static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
     if (hls->ph.picture_coding_type == 2) {
         refs.num = nlist[0];
         for (int j = 0; j < nlist[0]; j++) {
-            const pic_t *r = find_doi(d, list[0][j]);
+            const ref_t *e = &list[0][j];
+            const pic_t *r = e->lib ? find_lib(d, e->key) : find_doi(d, e->key);
             if (!r)
                 return SVAC3_ERR_CORRUPT;       /* reference not decoded */
             refs.ref[j] = &r->f;
-            /* bounded for a conforming stream (POIs within 128); clamp a corrupt one */
-            const int64_t dist = 2 * (poi - r->poi);
-            refs.dist[j] = dist < -32768 ? -32768 : dist > 32767 ? 32767 : (int)dist;
+            /* a library reference's DistanceIndex is 2 * (POI - 1) (5.4.3.3) */
+            refs.dist[j] = (int)clamp_dist(e->lib ? 2 : 2 * (poi - r->poi));
             if (j == 0)
                 refs.col = r->tmv;
         }

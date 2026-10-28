@@ -15,12 +15,12 @@ tool set of the GB/T SVAC 3.0 draft.
  libavcodec/codec_id.h     |   1 +
  libavcodec/libsvac3d.c    | 203 ++++++++++++++++++++++++++++++++++++++
  libavcodec/parsers.c      |   1 +
- libavcodec/svac3.h        |  54 ++++++++++
- libavcodec/svac3_parser.c | 118 ++++++++++++++++++++++
+ libavcodec/svac3.h        |  56 +++++++++++
+ libavcodec/svac3_parser.c | 121 +++++++++++++++++++++++
  libavformat/Makefile      |   1 +
  libavformat/allformats.c  |   1 +
  libavformat/svac3dec.c    |  64 ++++++++++++
- 12 files changed, 458 insertions(+)
+ 12 files changed, 463 insertions(+)
  create mode 100644 libavcodec/libsvac3d.c
  create mode 100644 libavcodec/svac3.h
  create mode 100644 libavcodec/svac3_parser.c
@@ -348,10 +348,10 @@ index b54442a..ec8fc55 100644
  extern const FFCodecParser ff_vorbis_parser;
 diff --git a/libavcodec/svac3.h b/libavcodec/svac3.h
 new file mode 100644
-index 0000000..ba3f4c1
+index 0000000..ea87c5f
 --- /dev/null
 +++ b/libavcodec/svac3.h
-@@ -0,0 +1,54 @@
+@@ -0,0 +1,56 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -386,6 +386,8 @@ index 0000000..ba3f4c1
 +    SVAC3_NAL_SEC_PS     = 9,
 +    SVAC3_NAL_AUTH_DATA  = 10,
 +    SVAC3_NAL_EOS        = 11,
++    SVAC3_NAL_RL_PATCH   = 14,    ///< a picture referencing a library picture
++    SVAC3_NAL_LIBRARY_PATCH = 17, ///< a displayed library picture
 +};
 +
 +#define SVAC3_NAL_TYPE(h1) ((h1) & 0x1f)
@@ -408,10 +410,10 @@ index 0000000..ba3f4c1
 +#endif /* AVCODEC_SVAC3_H */
 diff --git a/libavcodec/svac3_parser.c b/libavcodec/svac3_parser.c
 new file mode 100644
-index 0000000..73bbf5e
+index 0000000..1fcf1c2
 --- /dev/null
 +++ b/libavcodec/svac3_parser.c
-@@ -0,0 +1,118 @@
+@@ -0,0 +1,121 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -482,7 +484,10 @@ index 0000000..73bbf5e
 +        if (p[0] || p[1] || p[2] != 1)
 +            continue;
 +        type = SVAC3_NAL_TYPE(p[4]);
-+        if (type == SVAC3_NAL_IDR_PATCH || type == SVAC3_NAL_RAPI_PATCH) {
++        /* IDR and RAP-I pictures, and displayed library pictures, which are
++         * I pictures too; an RL picture needs its library picture */
++        if (type == SVAC3_NAL_IDR_PATCH || type == SVAC3_NAL_RAPI_PATCH ||
++            type == SVAC3_NAL_LIBRARY_PATCH) {
 +            s->key_frame = 1;
 +            s->pict_type = AV_PICTURE_TYPE_I;
 +        }

@@ -54,6 +54,7 @@ jobs:
         run: |
           mkdir -p corpus_patch
           head -c 60000 tests/streams/cv608_synth_1080p_cbr2m.svac3 > corpus_patch/idr.svac3
+          head -c 60000 tests/streams/cv608_smartp_1080p.svac3 > corpus_patch/library.svac3
           ./fuzz_patch -max_total_time=60 -max_len=65536 corpus_patch
 
   ffmpeg:
