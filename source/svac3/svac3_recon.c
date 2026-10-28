@@ -318,6 +318,9 @@ void svac3_dequant_itrans(const int16_t *quant, int M1, int M2, int qp, int16_t 
     const int shift = dq_shift[qp] + m + BIT_DEPTH - 14;
     const int rect = (M1 == 2 * M2) || (M2 == 2 * M1) || (M1 == 8 * M2) || (M2 == 8 * M1);
 
+    /* coefficients past the last non-zero column (nx) and row (ny) are zero
+     * and contribute nothing to either pass */
+    int nx = 0, ny = 0;
     for (int i = 0; i < M1 * M2; i++) {
         /* flat weights: (q * 64) >> WqmShift(2) == q * 16 */
         int64_t v = ((((int64_t)quant[i] * 16) * dq_tab[qp]) >> 4);
@@ -326,14 +329,20 @@ void svac3_dequant_itrans(const int16_t *quant, int M1, int M2, int qp, int16_t 
         if (rect)
             c = (c * 181 + (1 << 7)) >> 8;
         coef[i] = c;
+        if (c) {
+            if (i % M1 >= nx)
+                nx = i % M1 + 1;
+            if (i / M1 >= ny)
+                ny = i / M1 + 1;
+        }
     }
 
     /* vertical: K[x][y] = sum_k T_M2[k][y] * C[x][k], then (+16) >> 5 */
     const int8_t *tv = dct2(M2), *th = dct2(M1);
-    for (int x = 0; x < M1; x++)
+    for (int x = 0; x < nx; x++)
         for (int y = 0; y < M2; y++) {
             int64_t s = 0;
-            for (int kk = 0; kk < M2; kk++)
+            for (int kk = 0; kk < ny; kk++)
                 s += (int64_t)tv[kk * M2 + y] * coef[kk * M1 + x];
             k[y * M1 + x] = clip3(-32768, 32767, (int)((s + 16) >> 5));
         }
@@ -342,7 +351,7 @@ void svac3_dequant_itrans(const int16_t *quant, int M1, int M2, int qp, int16_t 
     for (int y = 0; y < M2; y++)
         for (int x = 0; x < M1; x++) {
             int64_t s = 0;
-            for (int kk = 0; kk < M1; kk++)
+            for (int kk = 0; kk < nx; kk++)
                 s += (int64_t)k[y * M1 + kk] * th[kk * M1 + x];
             resid[y * M1 + x] = (int16_t)clip3(-maxv - 1, maxv,
                                                (int)((s + (1 << (shift1 - 1))) >> shift1));

@@ -3,7 +3,7 @@
  *
  * SVAC3 patch data parser (表32-36): SAO parameters, the coding tree, coding
  * units and transform blocks, decoded with the entropy decoder in
- * svac3_aec.c. It parses only; reconstruction comes later.
+ * svac3_aec.c, and reconstructs I and P pictures.
  *
  * Supported tool set: the one HiSilicon Main-profile encoders use (MAEC,
  * SRCC, EIPM, MIPF, TMVP, SAO, deblocking, CU delta QP). A stream that
@@ -37,13 +37,37 @@ int svac3_patch_supported(const svac3_hls_t *hls);
 int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
                       svac3_patch_stats_t *stats);
 
+/* Temporal motion of a decoded picture, one per 16x16 luma unit in raster
+ * order ((W + 15) / 16 units per row), 5.4.6.7.10.3. */
+typedef struct {
+    int16_t mv[2];           /* L0 motion vector, quarter samples */
+    int8_t ref;              /* L0 reference index, -1 for 'PRED_I' */
+    int32_t dist;            /* BlockDistance of that reference from the picture */
+} svac3_tmv_t;
+
+/* What a P picture is predicted from. */
+typedef struct {
+    int num;                                  /* pictures in reference list 0 */
+    const svac3_frame_t *ref[SVAC3_MAX_REFS];
+    int dist[SVAC3_MAX_REFS];                 /* BlockDistance: DistanceIndex of the
+                                                 current picture minus the reference's */
+    const svac3_tmv_t *col;                   /* temporal motion of ref[0] */
+} svac3_refs_t;
+
+/* Number of svac3_tmv_t a picture of this size stores. */
+size_t svac3_tmv_count(int pic_w, int pic_h);
+
 /* As svac3_patch_parse(), and also reconstruct the patch into frame,
- * including deblocking and SAO. Only I pictures are reconstructed so far;
- * for other pictures frame is left untouched. frame must hold the coded
- * picture in 4:2:0 (SVAC3_ERR_INVALID otherwise). Unlike the parse-only
- * call, a patch that does not end exactly on its last LCU is an error,
- * SVAC3_ERR_CORRUPT, and an allocation failure is SVAC3_ERR_NOMEM. */
+ * including deblocking and SAO. frame must hold the coded picture in 4:2:0
+ * (SVAC3_ERR_INVALID otherwise). A P picture needs refs, with at least
+ * NumRefActive[0] pictures of the same size, each with its temporal motion
+ * if TMVP is on; refs is ignored for an I picture. When tmv is not NULL it
+ * receives the picture's temporal motion (svac3_tmv_count() entries), for
+ * use as a later picture's refs->col. Unlike the parse-only call, a patch
+ * that does not end exactly on its last LCU is an error, SVAC3_ERR_CORRUPT,
+ * and an allocation failure is SVAC3_ERR_NOMEM. */
 int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
-                       svac3_frame_t *frame, svac3_patch_stats_t *stats);
+                       svac3_frame_t *frame, const svac3_refs_t *refs, svac3_tmv_t *tmv,
+                       svac3_patch_stats_t *stats);
 
 #endif /* SVAC3_PATCH_H */

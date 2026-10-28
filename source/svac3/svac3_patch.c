@@ -6,6 +6,7 @@
  * values of 表77.
  */
 #include "svac3_patch.h"
+#include "svac3_inter.h"
 #include "svac3_recon.h"
 #include "svac3_loopfilter.h"
 
@@ -61,6 +62,9 @@ typedef struct {
     uint8_t skip, intra;
     uint8_t ipm;             /* IntraLumaPredMode, when intra */
     uint8_t qp;              /* QPY of the coding unit */
+    uint8_t cbf;             /* the coding unit has coefficients */
+    int8_t ref;              /* L0 reference index, -1 when intra */
+    int16_t mv[2];           /* L0 motion vector */
     uint32_t cu_id;          /* which coding unit, for the deblocking filter */
 } scu_t;
 
@@ -88,8 +92,10 @@ typedef struct {
     uint8_t sig[64 * 64];
     uint16_t absv[64 * 64];
 
-    /* reconstruction (I pictures only, for now) */
+    /* reconstruction */
     svac3_frame_t *frame;
+    const svac3_refs_t *refs;
+    int tmvp;                /* PictureTmvpEnableFlag */
     int recon;
     int mipf;
     int patch_qp, prev_cu_qp, lcu_qp;
@@ -535,6 +541,176 @@ static void recon_chroma(parser_t *p, int x0, int y0, int w, int h, int cmode, i
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* Motion information, 5.4.6.7, for P pictures: one reference list, no
+ * affine, AMVR, UMVE, HMVP or MVAP. */
+
+static inline int clip3(int lo, int hi, int v) { return v < lo ? lo : v > hi ? hi : v; }
+
+/* Scale mv from block distance bdx to bde (the formula of 5.4.6.7.6.2) */
+static int scale_mv(int mv, int bde, int bdx)
+{
+    if (!bdx)
+        bdx = 1;                             /* not a conforming stream */
+    const int64_t m = (int64_t)mv * bde;
+    const int64_t a = m * (16384 / bdx);
+    const int64_t v = ((a < 0 ? -a : a) + 8192) >> 14;
+    const int sign = (m == 0) ? 0 : ((m < 0) != (bdx < 0)) ? -1 : 1;
+    const int64_t r = sign * v;
+    return r < -32768 ? -32768 : r > 32767 ? 32767 : (int)r;
+}
+
+static int ref_dist(const parser_t *p, int ref)
+{
+    return p->refs->dist[ref];
+}
+
+/* L0 motion of the inter coding unit covering (x, y), or ref -1 */
+static int nb_motion(const parser_t *p, int x, int y, int mv[2])
+{
+    const scu_t *s = scu_at(p, x, y);
+    mv[0] = mv[1] = 0;
+    if (!s || s->intra || s->ref < 0)
+        return -1;
+    mv[0] = s->mv[0];
+    mv[1] = s->mv[1];
+    return s->ref;
+}
+
+static int median3(int a, int b, int c)
+{
+    if ((a < 0 && b > 0 && c > 0) || (a > 0 && b < 0 && c < 0))
+        return (b + c) / 2;
+    if ((b < 0 && a > 0 && c > 0) || (b > 0 && a < 0 && c < 0))
+        return (a + c) / 2;
+    if ((c < 0 && a > 0 && b > 0) || (c > 0 && a < 0 && b < 0))
+        return (a + b) / 2;
+    const int ab = abs(a - b), bc = abs(b - c), ca = abs(c - a);
+    if (ab <= bc && ab <= ca)
+        return (a + b) / 2;
+    if (bc <= ab && bc <= ca)
+        return (b + c) / 2;
+    return (a + c) / 2;
+}
+
+/* 5.4.6.7.6.2 and 5.4.6.7.7.2: the motion vector of a 'P_2M_2N' unit */
+static void derive_mvp(const parser_t *p, int x0, int y0, int w, int ref, const int mvd[2],
+                       int mv[2])
+{
+    const int x1 = x0 + w - 1;
+    const int pos[4][2] = { { x0 - 1, y0 }, { x0, y0 - 1 }, { x1 + 1, y0 - 1 }, { x0 - 1, y0 - 1 } };
+    int nmv[4][2], nref[4];
+
+    /* A neighbour outside the picture is unavailable. 5.4.6.7.6.2 moves it
+     * back inside the LCU and the picture first; the reference decoder does
+     * not (docs/errata.md). */
+    for (int i = 0; i < 4; i++)
+        nref[i] = nb_motion(p, pos[i][0], pos[i][1], nmv[i]);
+    if (nref[2] < 0) {                       /* C falls back to D */
+        nref[2] = nref[3];
+        nmv[2][0] = nmv[3][0];
+        nmv[2][1] = nmv[3][1];
+    }
+    const int bde = ref_dist(p, ref);
+    int MV[3][2] = { { 0 } }, n = 0, last = 0;
+    for (int i = 0; i < 3; i++) {
+        if (nref[i] < 0)
+            continue;
+        const int bdx = ref_dist(p, nref[i]);
+        MV[i][0] = scale_mv(nmv[i][0], bde, bdx);
+        MV[i][1] = scale_mv(nmv[i][1], bde, bdx);
+        n++;
+        last = i;
+    }
+    for (int c = 0; c < 2; c++) {
+        const int pred = n == 1 ? MV[last][c] : median3(MV[0][c], MV[1][c], MV[2][c]);
+        mv[c] = clip3(-32768, 32767, pred + mvd[c]);
+    }
+}
+
+/* 5.4.6.7.8: 'P_Skip'/'P_Direct' with CuSubTypeIndex 0 (temporal, 5.4.6.7.8.4.2)
+ * or 1 (spatial list 0, 5.4.6.7.8.3.2) */
+static void derive_skip_motion(const parser_t *p, int x0, int y0, int w, int h, int subtype,
+                               int *ref, int mv[2])
+{
+    *ref = 0;
+    mv[0] = mv[1] = 0;
+    if (subtype == 0) {
+        if (!p->tmvp || !p->refs->col)
+            return;
+        const svac3_tmv_t *t = &p->refs->col[(y0 >> 4) * ((p->pic_w + 15) >> 4) + (x0 >> 4)];
+        if (t->ref < 0)
+            return;
+        mv[0] = scale_mv(t->mv[0], ref_dist(p, 0), t->dist);
+        mv[1] = scale_mv(t->mv[1], ref_dist(p, 0), t->dist);
+        return;
+    }
+    const int x1 = x0 + w - 1, y1 = y0 + h - 1;
+    const int pos[6][2] = { { x0 - 1, y1 }, { x1, y0 - 1 }, { x1 + 1, y0 - 1 },
+                            { x0 - 1, y0 }, { x0, y0 - 1 }, { x0 - 1, y0 - 1 } };   /* F G C A B D */
+    for (int i = 0; i < 6; i++) {
+        const int r = nb_motion(p, pos[i][0], pos[i][1], mv);
+        if (r >= 0) {
+            *ref = r;
+            return;
+        }
+    }
+}
+
+static void recon_inter(parser_t *p, int x0, int y0, int w, int h, int ref, const int mv[2],
+                        int qp, int ctp, int chroma)
+{
+    const svac3_frame_t *rf = p->refs->ref[ref];
+    svac3_mc_luma(rf, x0, y0, w, h, mv[0], mv[1], p->pred);
+    const int16_t *res = NULL;
+    if (ctp & 1) {
+        svac3_dequant_itrans(p->coef[0], w, h, qp, p->resid);
+        res = p->resid;
+    }
+    svac3_put_block(p->frame, 0, x0, y0, w, h, p->pred, res);
+    if (!chroma)
+        return;
+    for (int c = 1; c <= 2; c++) {
+        svac3_mc_chroma(rf, c, x0 / 2, y0 / 2, w / 2, h / 2, mv[0], mv[1], p->pred);
+        res = NULL;
+        if (ctp & (1 << c)) {
+            const int cqp = svac3_chroma_qp(qp, c == 1 ? p->cb_delta : p->cr_delta);
+            svac3_dequant_itrans(p->coef[c], w / 2, h / 2, cqp, p->resid);
+            res = p->resid;
+        }
+        svac3_put_block(p->frame, c, x0 / 2, y0 / 2, w / 2, h / 2, p->pred, res);
+    }
+}
+
+/* The chroma of a luma region coded as several inter coding units: each
+ * 2x2 chroma unit is predicted with the motion of its 4x4 luma unit. No
+ * stream in the corpus has one (the encoders do not split an inter-only
+ * node below 8x8), so this path is not checked against the reference. */
+static void recon_chroma_inter(parser_t *p, int x0, int y0, int w, int h, int qp, int ctp)
+{
+    const int K = w / 2, L = h / 2;
+    for (int c = 1; c <= 2; c++) {
+        for (int y = 0; y < L; y += 2)
+            for (int x = 0; x < K; x += 2) {
+                const scu_t *s = scu_at(p, x0 + 2 * x, y0 + 2 * y);
+                uint8_t blk[4] = { 128, 128, 128, 128 };
+                if (s && s->ref >= 0)
+                    svac3_mc_chroma(p->refs->ref[s->ref], c, x0 / 2 + x, y0 / 2 + y, 2, 2,
+                                    s->mv[0], s->mv[1], blk);
+                for (int j = 0; j < 2; j++)
+                    for (int i = 0; i < 2; i++)
+                        p->pred[(y + j) * K + x + i] = blk[j * 2 + i];
+            }
+        const int16_t *res = NULL;
+        if (ctp & (1 << c)) {
+            const int cqp = svac3_chroma_qp(qp, c == 1 ? p->cb_delta : p->cr_delta);
+            svac3_dequant_itrans(p->coef[c], K, L, cqp, p->resid);
+            res = p->resid;
+        }
+        svac3_put_block(p->frame, c, x0 / 2, y0 / 2, K, L, p->pred, res);
+    }
+}
+
 static void coding_unit_chroma(parser_t *p, int x0, int y0, int w, int h)
 {
     const scu_t *luma = scu_at(p, x0 + w - 1, y0 + h - 1);
@@ -551,9 +727,11 @@ static void coding_unit_chroma(parser_t *p, int x0, int y0, int w, int h)
             parse_srcc_block(p, w / 2, h / 2, 1, prior_intra, p->coef[i]);
     p->st->chroma_cus++;
 
-    if (p->recon && luma)
+    if (p->recon && luma && prior_intra)
         recon_chroma(p, x0, y0, w, h, derive_chroma_mode(cidx, luma->ipm), luma->ipm,
                      luma->qp, ctp);
+    else if (p->recon && luma)
+        recon_chroma_inter(p, x0, y0, w, h, luma->qp, ctp);
 }
 
 static void coding_unit(parser_t *p, int x0, int y0, int w, int h, int mode, int comp)
@@ -588,23 +766,24 @@ static void coding_unit(parser_t *p, int x0, int y0, int w, int h, int mode, int
             intra = 0;
     }
 
+    int subtype = 0, ref = 0, mvd[2] = { 0, 0 };
     if (skip || direct) {
         /* cu_subtype_index: TU, maxVal 1 for P (no MVAP or HMVP candidates) */
         const int maxv = (p->pct == 2 ? 1 : 3);
-        for (int b = 0; b < maxv && !bin(p, CTX_CU_SUBTYPE + b); b++)
-            ;
+        while (subtype < maxv && !bin(p, CTX_CU_SUBTYPE + subtype))
+            subtype++;
     }
 
     if (!skip && !direct) {
         if (!intra) {
             if (p->num_ref_active0 > 1)
-                for (int b = 0; b < p->num_ref_active0 - 1 &&
-                     !bin(p, CTX_REF_IDX + (b < 2 ? b : 2)); b++)
-                    ;
-            if (parse_mvd_abs(p, CTX_MVD_X))
-                byp(p);
-            if (parse_mvd_abs(p, CTX_MVD_Y))
-                byp(p);
+                while (ref < p->num_ref_active0 - 1 && !bin(p, CTX_REF_IDX + (ref < 2 ? ref : 2)))
+                    ref++;
+            for (int i = 0; i < 2; i++) {
+                mvd[i] = parse_mvd_abs(p, i ? CTX_MVD_Y : CTX_MVD_X);
+                if (mvd[i] && byp(p))        /* mv_diff_sign */
+                    mvd[i] = -mvd[i];
+            }
         } else {
             /* intra_luma_pred_mode_index (表78/表98), then luma_eipm_index */
             if (bin(p, CTX_INTRA_LUMA + 0)) {
@@ -673,6 +852,7 @@ static void coding_unit(parser_t *p, int x0, int y0, int w, int h, int mode, int
     const int qp = derive_qp(p, x0, y0, ctp, dqp);
     const int lmode = intra ? derive_luma_mode(p, x0, y0, lidx, eipm) : 0;
 
+    int mv[2] = { 0, 0 };
     if (p->recon && intra) {
         svac3_intra_pred(p->frame, 0, x0, y0, w, h, lmode, 0, p->mipf, avail_cb, p, p->pred);
         const int16_t *res = NULL;
@@ -681,16 +861,26 @@ static void coding_unit(parser_t *p, int x0, int y0, int w, int h, int mode, int
             res = p->resid;
         }
         svac3_put_block(p->frame, 0, x0, y0, w, h, p->pred, res);
+    } else if (p->recon) {
+        if (skip || direct)
+            derive_skip_motion(p, x0, y0, w, h, subtype, &ref, mv);
+        else
+            derive_mvp(p, x0, y0, w, ref, mvd, mv);
+        recon_inter(p, x0, y0, w, h, ref, mv, qp, ctp, comp == COMP_LUMACHROMA);
     }
 
     scu_mark(p, x0, y0, w, h, skip, intra);
-    /* the mark above makes this CU's own samples "available"; record its mode
-     * and QP for later neighbours and for a deferred chroma CU */
+    /* the mark above makes this CU's own samples "available"; record its mode,
+     * QP and motion for later neighbours and for a deferred chroma CU */
     for (int yy = y0; yy < y0 + h && yy < p->pic_h; yy += 4)
         for (int xx = x0; xx < x0 + w && xx < p->pic_w; xx += 4) {
             scu_t *s = &p->scu[(yy >> 2) * p->scu_stride + (xx >> 2)];
             s->ipm = (uint8_t)lmode;
             s->qp = (uint8_t)qp;
+            s->cbf = ctp != 0;
+            s->ref = (int8_t)(intra ? -1 : ref);
+            s->mv[0] = (int16_t)mv[0];
+            s->mv[1] = (int16_t)mv[1];
         }
 
     if (p->recon && intra && comp == COMP_LUMACHROMA)
@@ -867,21 +1057,31 @@ static int loop_filters(parser_t *p, const svac3_hls_t *hls)
 {
     const size_t n = (size_t)p->scu_stride * ((p->pic_h + 3) / 4);
     uint32_t *id = malloc(n * sizeof(*id));
-    uint8_t *qp = malloc(n);
+    uint8_t *qp = malloc(n), *cbf = malloc(n);
+    int8_t *ref = malloc(n);
+    int16_t *mv = malloc(n * 2 * sizeof(*mv));
 
-    if (!id || !qp) {
+    if (!id || !qp || !cbf || !ref || !mv) {
         free(id);
         free(qp);
+        free(cbf);
+        free(ref);
+        free(mv);
         return SVAC3_ERR_NOMEM;
     }
     if (!hls->pps.deblocking_filter_disable_flag) {
         for (size_t i = 0; i < n; i++) {
             id[i] = p->scu[i].cu_id;
             qp[i] = p->scu[i].qp;
+            cbf[i] = p->scu[i].cbf;
+            ref[i] = p->scu[i].intra ? -1 : p->scu[i].ref;
+            mv[2 * i] = p->scu[i].mv[0];
+            mv[2 * i + 1] = p->scu[i].mv[1];
         }
         svac3_dbk_info_t d = {
             .pic_w = p->pic_w, .pic_h = p->pic_h, .stride = p->scu_stride,
             .cu_id = id, .qp = qp,
+            .inter = p->pct != 1, .cbf = cbf, .ref = ref, .mv = mv,
             .alpha_offset = hls->ph.alpha_c_offset, .beta_offset = hls->ph.beta_offset,
             .filter_type = hls->pps.deblocking_filter_type,
             .cb_delta = p->cb_delta, .cr_delta = p->cr_delta,
@@ -890,6 +1090,9 @@ static int loop_filters(parser_t *p, const svac3_hls_t *hls)
     }
     free(id);
     free(qp);
+    free(cbf);
+    free(ref);
+    free(mv);
     if (p->sps->sao_enable_flag)
         return svac3_sao(p->frame, (const svac3_sao_t (*)[3])p->sao, p->lcu_size, p->lcu_w, p->lcu_h)
                ? SVAC3_ERR_NOMEM : SVAC3_OK;
@@ -905,6 +1108,35 @@ static int frame_ok(const svac3_frame_t *f, int w, int h)
             return 0;
     }
     return 1;
+}
+
+size_t svac3_tmv_count(int pic_w, int pic_h)
+{
+    return (size_t)((pic_w + 15) >> 4) * (size_t)((pic_h + 15) >> 4);
+}
+
+/* 5.4.6.7.10.3 with EtmvpMvapEnableFlag, SbTmvpEnableFlag,
+ * MvpRefLayerEnableFlag and AwpEnableFlag 0: the motion at the centre of
+ * each 16x16 unit */
+static void store_tmv(const parser_t *p, svac3_tmv_t *t)
+{
+    const int tw = (p->pic_w + 15) >> 4, th = (p->pic_h + 15) >> 4;
+    for (int ty = 0; ty < th; ty++)
+        for (int tx = 0; tx < tw; tx++) {
+            const int x0 = tx << 4, y0 = ty << 4;
+            const int nw = x0 + 16 >= p->pic_w ? p->pic_w - x0 : 16;
+            const int nh = y0 + 16 >= p->pic_h ? p->pic_h - y0 : 16;
+            const scu_t *s = scu_at(p, x0 + nw / 2, y0 + nh / 2);
+            svac3_tmv_t *o = &t[ty * tw + tx];
+            memset(o, 0, sizeof(*o));
+            o->ref = -1;
+            if (s && !s->intra && s->ref >= 0 && p->refs) {
+                o->ref = s->ref;
+                o->mv[0] = s->mv[0];
+                o->mv[1] = s->mv[1];
+                o->dist = p->refs->dist[s->ref];
+            }
+        }
 }
 
 int svac3_patch_supported(const svac3_hls_t *hls)
@@ -958,11 +1190,30 @@ int svac3_patch_supported(const svac3_hls_t *hls)
 int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
                       svac3_patch_stats_t *st)
 {
-    return svac3_patch_decode(hls, data, len, NULL, st);
+    return svac3_patch_decode(hls, data, len, NULL, NULL, NULL, st);
+}
+
+/* References for a P picture: enough of them, each the size of frame, with
+ * temporal motion when TMVP needs it */
+static int refs_ok(const svac3_refs_t *r, int need, const svac3_frame_t *frame, int tmvp)
+{
+    if (!r || r->num < need || r->num > SVAC3_MAX_REFS)
+        return 0;
+    for (int i = 0; i < r->num; i++) {
+        const svac3_frame_t *f = r->ref[i];
+        if (!f)
+            return 0;
+        for (int c = 0; c < 3; c++)
+            if (!f->plane[c] || f->width[c] != frame->width[c] ||
+                f->height[c] != frame->height[c] || f->stride[c] < f->width[c])
+                return 0;
+    }
+    return !tmvp || r->col;
 }
 
 int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
-                       svac3_frame_t *frame, svac3_patch_stats_t *st)
+                       svac3_frame_t *frame, const svac3_refs_t *refs, svac3_tmv_t *tmv,
+                       svac3_patch_stats_t *st)
 {
     parser_t *p;
     int ret = svac3_patch_supported(hls);
@@ -1007,8 +1258,14 @@ int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
         free(p);
         return SVAC3_ERR_INVALID;
     }
+    p->tmvp = hls->ph.picture_tmvp_enable_flag;
+    if (frame && p->pct == 2 && !refs_ok(refs, p->num_ref_active0, frame, p->tmvp)) {
+        free(p);
+        return SVAC3_ERR_INVALID;
+    }
     p->frame = frame;
-    p->recon = frame != NULL && p->pct == 1;
+    p->refs = p->pct == 2 ? refs : NULL;
+    p->recon = frame != NULL;
     p->mipf = s->mipf_enable_flag;
     p->patch_qp = hls->pps.fixed_picture_qp_flag ? hls->ph.picture_qp : hls->patch.patch_qp;
     p->prev_cu_qp = p->lcu_qp = p->patch_qp;
@@ -1091,8 +1348,10 @@ int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
         /* a picture that did not parse to its exact end is not a picture */
         if (!st->stuffing_ok || st->overrun_bits)
             ret = SVAC3_ERR_CORRUPT;
-        else if (p->recon)
+        else
             ret = loop_filters(p, hls);
+        if (ret == SVAC3_OK && tmv)
+            store_tmv(p, tmv);
     }
     free(p->sao);
     free(p->scu);

@@ -490,6 +490,8 @@ static int parse_ph(bits_t *b, const svac3_sps_t *s, const svac3_pps_t *p,
         F(h->picture_rpr_flag, "picture_rpr_flag", 1);
     if (s->profile_id != 0x30 && s->tmvp_enable_flag)
         F(h->picture_tmvp_enable_flag, "picture_tmvp_enable_flag", 1);
+    else
+        h->picture_tmvp_enable_flag = s->tmvp_enable_flag;   /* inferred */
     if (t != 1)
         F(h->random_access_decodable_flag, "random_access_decodable_flag", 1);
     F(h->bbv_delay, "bbv_delay", 32);
