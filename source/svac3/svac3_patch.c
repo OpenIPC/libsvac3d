@@ -6,6 +6,8 @@
  * values of 表77.
  */
 #include "svac3_patch.h"
+#include "svac3_recon.h"
+#include "svac3_loopfilter.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -55,8 +57,11 @@ enum { NO_SPLIT, SPLIT_QT, SPLIT_BT_VER, SPLIT_BT_HOR, SPLIT_EQT_VER, SPLIT_EQT_
 /* What later coding units need to know about a decoded one, per 4x4. */
 typedef struct {
     uint8_t coded;
-    uint8_t w, h;            /* CU size in luma samples (w, h <= 128: stored /1) */
+    uint8_t w, h;            /* CU size in luma samples */
     uint8_t skip, intra;
+    uint8_t ipm;             /* IntraLumaPredMode, when intra */
+    uint8_t qp;              /* QPY of the coding unit */
+    uint32_t cu_id;          /* which coding unit, for the deblocking filter */
 } scu_t;
 
 typedef struct {
@@ -82,6 +87,19 @@ typedef struct {
     int16_t order[64 * 64];
     uint8_t sig[64 * 64];
     uint16_t absv[64 * 64];
+
+    /* reconstruction (I pictures only, for now) */
+    svac3_frame_t *frame;
+    int recon;
+    int mipf;
+    int patch_qp, prev_cu_qp, lcu_qp;
+    int qp_group_x, qp_group_y;
+    int cb_delta, cr_delta;
+    uint32_t next_cu_id;
+    svac3_sao_t (*sao)[3];   /* per LCU */
+    int16_t coef[3][64 * 64];
+    int16_t resid[64 * 64];
+    uint8_t pred[64 * 64];
 } parser_t;
 
 /* ------------------------------------------------------------------------ */
@@ -145,17 +163,21 @@ static void scu_mark(parser_t *p, int x0, int y0, int w, int h, int skip, int in
             s->h = (uint8_t)(h > 255 ? 255 : h);
             s->skip = (uint8_t)skip;
             s->intra = (uint8_t)intra;
+            s->cu_id = p->next_cu_id;
         }
+    p->next_cu_id++;
 }
 
 /* ------------------------------------------------------------------------ */
 /* SAO parameters, 表32; binarisation 5.3.3.4.6-10 (as in AVS3). */
 
-static void parse_sao(parser_t *p, int lcu_x, int lcu_y, const uint8_t sao_en[3])
+static void parse_sao(parser_t *p, int lcu_x, int lcu_y, const uint8_t sao_en[3],
+                      svac3_sao_t out[3])
 {
     const int left = lcu_x > 0, up = lcu_y > 0;
     int merge = 0;
 
+    memset(out, 0, sizeof(svac3_sao_t) * 3);
     if (left + up > 0) {
         int sym;
         if (left + up == 1) {
@@ -165,10 +187,21 @@ static void parse_sao(parser_t *p, int lcu_x, int lcu_y, const uint8_t sao_en[3]
             if (sym != 1)
                 sym += bin(p, CTX_SAO_MERGE + 2) << 1;
         }
-        merge = sym;
+        /* 表138: with both neighbours, 1 = left and 2 = up */
+        if (left && !up)
+            merge = sym ? 1 : 0;
+        else if (up && !left)
+            merge = sym ? 2 : 0;
+        else
+            merge = sym;
     }
-    if (merge)
+    if (merge) {
+        if (p->sao) {
+            const int l = lcu_y * p->lcu_w + lcu_x;
+            memcpy(out, p->sao[merge == 1 ? l - 1 : l - p->lcu_w], sizeof(svac3_sao_t) * 3);
+        }
         return;
+    }
 
     for (int c = 0; c < 3; c++) {
         if (!sao_en[c])
@@ -178,7 +211,8 @@ static void parse_sao(parser_t *p, int lcu_x, int lcu_y, const uint8_t sao_en[3]
         if (bin(p, CTX_SAO_MODE))
             mode = 0;
         else
-            mode = byp(p) ? 1 : 2;           /* 1 = interval (BO), 2 = edge */
+            mode = byp(p) ? 1 : 2;           /* 1 = interval, 2 = edge */
+        out[c].mode = (uint8_t)mode;
         if (mode == 0)
             continue;
         if (mode == 1) {
@@ -187,22 +221,36 @@ static void parse_sao(parser_t *p, int lcu_x, int lcu_y, const uint8_t sao_en[3]
                 int a = !bin(p, CTX_SAO_OFFSET);
                 if (a) {
                     a += byp_tu(p, 6);
-                    byp(p);                  /* sao_interval_offset_sign */
+                    if (byp(p))              /* sao_interval_offset_sign */
+                        a = -a;
                 }
+                out[c].offset[j] = (int8_t)a;
             }
+            int start = 0;                   /* sao_interval_start_pos, LSB first */
             for (int k = 0; k < 5; k++)
-                byp(p);                      /* sao_interval_start_pos */
+                start |= byp(p) << k;
             /* sao_interval_delta_pos_minus2 (表85) */
-            int order = 1 + byp_tu(p, 3);
-            for (int k = 0; k < order % 4; k++)
-                byp(p);
+            const int order = 1 + byp_tu(p, 3);
+            int d = (1 << order) - 2, v = 0;
+            for (int k = order % 4 - 1; k >= 0; k--)
+                v |= byp(p) << k;
+            out[c].start_pos = (uint8_t)start;
+            out[c].delta_pos_minus2 = (uint8_t)(d + v);
         } else {
-            /* sao_edge_offset[j]: TU in bypass; maxima as in AVS3 */
-            static const int maxv[4] = { 7, 1, 1, 7 };
-            for (int j = 0; j < 4; j++)
-                byp_tu(p, maxv[j] == 7 ? 6 + 1 : 1);
-            byp(p);                          /* sao_edge_type, 2 bins */
-            byp(p);
+            /* sao_edge_offset (表86/表87), then sao_edge_type */
+            static const int inv0[8] = { 1, 0, 2, -1, 3, 4, 5, 6 };
+            int cnt;
+            cnt = byp_tu(p, 7);
+            out[c].offset[0] = (int8_t)inv0[cnt];
+            cnt = byp_tu(p, 1);
+            out[c].offset[1] = (int8_t)cnt;
+            cnt = byp_tu(p, 1);
+            out[c].offset[2] = (int8_t)-cnt;
+            cnt = byp_tu(p, 7);
+            out[c].offset[3] = (int8_t)-inv0[cnt];
+            int t = byp(p);
+            t |= byp(p) << 1;
+            out[c].edge_type = (uint8_t)t;
         }
     }
 }
@@ -250,13 +298,14 @@ static int pos_class(int px, int py, int srx, int sry, int intra)
     return (px <= srx / 2 && py <= sry / 2) ? 4 : 8;
 }
 
-static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra)
+static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra, int16_t *out)
 {
     int16_t *order = p->order;
     uint8_t *sig = p->sig;
     uint16_t *absv = p->absv;
     const int log2w = ilog2(w);
 
+    memset(out, 0, sizeof(*out) * (size_t)w * h);
     const int srx = parse_scan_region(p, CTX_SCAN_REGION_X, w, is_chroma);
     const int sry = parse_scan_region(p, CTX_SCAN_REGION_Y, h, is_chroma);
     if (srx >= w || sry >= h) {
@@ -378,11 +427,16 @@ static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra
                     absv[bp] = (uint16_t)(absv[bp] + byp_eg0(p));
             }
         }
-        for (int n = top; n >= 0; n--)
-            if (sig[order[set_pos + n]]) {
-                byp(p);                      /* coeff_sign */
+        for (int n = top; n >= 0; n--) {
+            const int bp = order[set_pos + n];
+            if (sig[bp]) {
+                const int neg = byp(p);      /* coeff_sign */
+                const int px = bp & (w - 1), py = bp >> log2w;
+                int a = absv[bp] > 32767 ? 32767 : absv[bp];
+                out[py * w + px] = (int16_t)(neg ? -a : a);
                 p->st->coeffs++;
             }
+        }
     }
     p->st->coded_blocks++;
 }
@@ -403,26 +457,109 @@ static int parse_mvd_abs(parser_t *p, int ctx)
     return 3 + 2 * (int)byp_eg0(p) + even;
 }
 
+static int avail_cb(void *opaque, int x, int y)
+{
+    return scu_at((const parser_t *)opaque, x, y) != NULL;
+}
+
+/* 5.4.6.6.3.2: IntraLumaPredMode from the parsed index and the neighbours */
+static int derive_luma_mode(const parser_t *p, int x0, int y0, int idx, int eipm)
+{
+    const scu_t *A = scu_at(p, x0 - 1, y0), *B = scu_at(p, x0, y0 - 1);
+    const int a = (A && A->intra) ? A->ipm : 0, b = (B && B->intra) ? B->ipm : 0;
+    int pred0, pred1;
+
+    if (a != b) {
+        pred0 = a < b ? a : b;
+        pred1 = a < b ? b : a;
+    } else if (a == 0) {
+        pred0 = 0;
+        pred1 = 2;
+    } else {
+        pred0 = 0;
+        pred1 = a;
+    }
+    if (idx == 0)
+        return pred0;
+    if (idx == 1)
+        return pred1;
+    int m = idx + eipm * 32;
+    if (m - 2 < pred0)
+        m -= 2;
+    else if (m - 1 > pred0 && m - 1 < pred1)
+        m -= 1;
+    return m;
+}
+
+/* 5.4.6.6.3.4 */
+static int derive_chroma_mode(int idx, int luma_mode)
+{
+    if (!(luma_mode == 0 || luma_mode == 2 || luma_mode == 12 || luma_mode == 24))
+        return idx;
+    const int pred = luma_mode == 0 ? 1 : luma_mode == 2 ? 4 : luma_mode == 12 ? 3 : 2;
+    if (idx == 0)
+        return 0;
+    return idx < pred ? idx : idx + 1;
+}
+
+/* 5.4.6.2, first step */
+static int derive_qp(parser_t *p, int x0, int y0, int ctp, int delta)
+{
+    if (p->fixed_qp || !p->cu_delta_qp_flag)
+        return p->lcu_qp;
+    if (x0 == p->qp_group_x && y0 == p->qp_group_y) {
+        const scu_t *A = scu_at(p, x0 - 1, y0);
+        p->prev_cu_qp = A ? A->qp : p->patch_qp;
+    }
+    /* CuDeltaQp is -32..31 for 8-bit video; a value outside it is not a
+     * conforming stream, but must still give a QP in 0..63 */
+    const int qp = ctp ? (((p->prev_cu_qp + delta) % 64) + 64) % 64 : p->prev_cu_qp;
+    p->prev_cu_qp = qp;
+    return qp;
+}
+
+static void recon_chroma(parser_t *p, int x0, int y0, int w, int h, int cmode, int lmode,
+                         int qp, int ctp)
+{
+    const int K = w / 2, L = h / 2;
+    for (int c = 1; c <= 2; c++) {
+        svac3_intra_pred(p->frame, c, x0 / 2, y0 / 2, K, L, cmode, lmode, p->mipf,
+                         avail_cb, p, p->pred);
+        const int16_t *res = NULL;
+        if (ctp & (1 << c)) {
+            const int cqp = svac3_chroma_qp(qp, c == 1 ? p->cb_delta : p->cr_delta);
+            svac3_dequant_itrans(p->coef[c], K, L, cqp, p->resid);
+            res = p->resid;
+        }
+        svac3_put_block(p->frame, c, x0 / 2, y0 / 2, K, L, p->pred, res);
+    }
+}
+
 static void coding_unit_chroma(parser_t *p, int x0, int y0, int w, int h)
 {
     const scu_t *luma = scu_at(p, x0 + w - 1, y0 + h - 1);
     const int prior_intra = luma && luma->intra;
-    int ctp;
+    int ctp, cidx = 0;
 
     if (prior_intra)
-        for (int b = 0; b < 4 && !bin(p, CTX_INTRA_CHROMA + (b ? 1 : 0)); b++)
+        for (; cidx < 4 && !bin(p, CTX_INTRA_CHROMA + (cidx ? 1 : 0)); cidx++)
             ;
     ctp = (bin(p, CTX_CTP_U) << 1);
     ctp |= (bin(p, CTX_CTP_V) << 2);
     for (int i = 1; i < 3; i++)
         if (ctp & (1 << i))
-            parse_srcc_block(p, w / 2, h / 2, 1, prior_intra);
+            parse_srcc_block(p, w / 2, h / 2, 1, prior_intra, p->coef[i]);
     p->st->chroma_cus++;
+
+    if (p->recon && luma)
+        recon_chroma(p, x0, y0, w, h, derive_chroma_mode(cidx, luma->ipm), luma->ipm,
+                     luma->qp, ctp);
 }
 
 static void coding_unit(parser_t *p, int x0, int y0, int w, int h, int mode, int comp)
 {
     int skip = 0, direct = 0, intra = p->pct == 1;
+    int lidx = 0, eipm = 0, cidx = 0, dqp = 0;
     const scu_t *A = scu_at(p, x0 - 1, y0), *B = scu_at(p, x0, y0 - 1);
 
     if (p->pct != 1) {
@@ -470,19 +607,18 @@ static void coding_unit(parser_t *p, int x0, int y0, int w, int h, int mode, int
                 byp(p);
         } else {
             /* intra_luma_pred_mode_index (表78/表98), then luma_eipm_index */
-            int idx;
             if (bin(p, CTX_INTRA_LUMA + 0)) {
-                idx = bin(p, CTX_INTRA_LUMA + 6);
+                lidx = bin(p, CTX_INTRA_LUMA + 6);
             } else {
-                idx = 0;
+                lidx = 0;
                 for (int b = 1; b <= 5; b++)
-                    idx = (idx << 1) | bin(p, CTX_INTRA_LUMA + b);
-                idx += 2;
+                    lidx = (lidx << 1) | bin(p, CTX_INTRA_LUMA + b);
+                lidx += 2;
             }
-            if (idx > 1)
-                bin(p, CTX_LUMA_EIPM);
+            if (lidx > 1)
+                eipm = bin(p, CTX_LUMA_EIPM);
             if (comp == COMP_LUMACHROMA)
-                for (int b = 0; b < 4 && !bin(p, CTX_INTRA_CHROMA + (b ? 1 : 0)); b++)
+                for (; cidx < 4 && !bin(p, CTX_INTRA_CHROMA + (cidx ? 1 : 0)); cidx++)
                     ;
         }
     }
@@ -519,21 +655,47 @@ static void coding_unit(parser_t *p, int x0, int y0, int w, int h, int mode, int
             if (a > 128)
                 break;
         }
-        if (a)
-            byp(p);                          /* cu_qp_delta_sign */
+        dqp = a;
+        if (a && byp(p))                     /* cu_qp_delta_sign */
+            dqp = -a;
         p->num_delta_qp++;
     }
 
     /* Chroma blocks are half the CU size (4:2:0). 表36's SRCC branch does not
      * halve them, but only the halved reading parses (docs/errata.md). */
     if (ctp & 1)
-        parse_srcc_block(p, w, h, 0, intra);
+        parse_srcc_block(p, w, h, 0, intra, p->coef[0]);
     if (ctp & 2)
-        parse_srcc_block(p, w / 2, h / 2, 1, intra);
+        parse_srcc_block(p, w / 2, h / 2, 1, intra, p->coef[1]);
     if (ctp & 4)
-        parse_srcc_block(p, w / 2, h / 2, 1, intra);
+        parse_srcc_block(p, w / 2, h / 2, 1, intra, p->coef[2]);
+
+    const int qp = derive_qp(p, x0, y0, ctp, dqp);
+    const int lmode = intra ? derive_luma_mode(p, x0, y0, lidx, eipm) : 0;
+
+    if (p->recon && intra) {
+        svac3_intra_pred(p->frame, 0, x0, y0, w, h, lmode, 0, p->mipf, avail_cb, p, p->pred);
+        const int16_t *res = NULL;
+        if (ctp & 1) {
+            svac3_dequant_itrans(p->coef[0], w, h, qp, p->resid);
+            res = p->resid;
+        }
+        svac3_put_block(p->frame, 0, x0, y0, w, h, p->pred, res);
+    }
 
     scu_mark(p, x0, y0, w, h, skip, intra);
+    /* the mark above makes this CU's own samples "available"; record its mode
+     * and QP for later neighbours and for a deferred chroma CU */
+    for (int yy = y0; yy < y0 + h && yy < p->pic_h; yy += 4)
+        for (int xx = x0; xx < x0 + w && xx < p->pic_w; xx += 4) {
+            scu_t *s = &p->scu[(yy >> 2) * p->scu_stride + (xx >> 2)];
+            s->ipm = (uint8_t)lmode;
+            s->qp = (uint8_t)qp;
+        }
+
+    if (p->recon && intra && comp == COMP_LUMACHROMA)
+        recon_chroma(p, x0, y0, w, h, derive_chroma_mode(cidx, lmode), lmode, qp, ctp);
+
     p->st->cus++;
     p->st->intra_cus += intra;
     p->st->skip_cus += skip;
@@ -649,8 +811,11 @@ static void coding_unit_tree(parser_t *p, int x0, int y0, int split, int w, int 
         p->luma_h = h;
         p->component = 1;
     }
-    if (!p->fixed_qp && p->cu_delta_qp_flag && w * h >= p->qp_group_area)
+    if (!p->fixed_qp && p->cu_delta_qp_flag && w * h >= p->qp_group_area) {
         p->num_delta_qp = 0;
+        p->qp_group_x = x0;
+        p->qp_group_y = y0;
+    }
 
     switch (smode) {
     case SPLIT_QT: {
@@ -698,6 +863,32 @@ static void coding_unit_tree(parser_t *p, int x0, int y0, int split, int w, int 
 
 /* ------------------------------------------------------------------------ */
 
+static void loop_filters(parser_t *p, const svac3_hls_t *hls)
+{
+    const size_t n = (size_t)p->scu_stride * ((p->pic_h + 3) / 4);
+    uint32_t *id = malloc(n * sizeof(*id));
+    uint8_t *qp = malloc(n);
+
+    if (id && qp && !hls->pps.deblocking_filter_disable_flag) {
+        for (size_t i = 0; i < n; i++) {
+            id[i] = p->scu[i].cu_id;
+            qp[i] = p->scu[i].qp;
+        }
+        svac3_dbk_info_t d = {
+            .pic_w = p->pic_w, .pic_h = p->pic_h, .stride = p->scu_stride,
+            .cu_id = id, .qp = qp,
+            .alpha_offset = hls->ph.alpha_c_offset, .beta_offset = hls->ph.beta_offset,
+            .filter_type = hls->pps.deblocking_filter_type,
+            .cb_delta = p->cb_delta, .cr_delta = p->cr_delta,
+        };
+        svac3_deblock(p->frame, &d);
+    }
+    free(id);
+    free(qp);
+    if (p->sps->sao_enable_flag)
+        svac3_sao(p->frame, (const svac3_sao_t (*)[3])p->sao, p->lcu_size, p->lcu_w, p->lcu_h);
+}
+
 int svac3_patch_supported(const svac3_hls_t *hls)
 {
     const svac3_sps_t *s = &hls->sps;
@@ -728,6 +919,12 @@ int svac3_patch_supported(const svac3_hls_t *hls)
         return SVAC3_ERR_UNSUPPORTED;       /* run-level coefficients not written yet */
     if (!s->stable_patch_flag || !s->uniform_patch_flag)
         return SVAC3_ERR_UNSUPPORTED;
+    /* picture_qp and patch_qp are 0..63 for 8-bit video (7-bit fields) */
+    if (hls->ph.picture_qp > 63 || (!hls->pps.fixed_picture_qp_flag && hls->patch.patch_qp > 63))
+        return SVAC3_ERR_INVALID;
+    if ((s->pic_width_in_luma & 7) || (s->pic_height_in_luma & 7) ||
+        !s->pic_width_in_luma || !s->pic_height_in_luma)
+        return SVAC3_ERR_INVALID;           /* coded size is a multiple of MiniSize (8) */
     if (s->log2_lcu_size_minus2 > 4)
         return SVAC3_ERR_UNSUPPORTED;       /* 128x128 LCUs (transform zero-out not written) */
     (void)p;
@@ -740,6 +937,12 @@ int svac3_patch_supported(const svac3_hls_t *hls)
 
 int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
                       svac3_patch_stats_t *st)
+{
+    return svac3_patch_decode(hls, data, len, NULL, st);
+}
+
+int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
+                       svac3_frame_t *frame, svac3_patch_stats_t *st)
 {
     parser_t *p;
     int ret = svac3_patch_supported(hls);
@@ -780,6 +983,13 @@ int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
         return SVAC3_ERR_INVALID;
     }
     p->num_ref_active0 = (int)ref_minus1 + 1;
+    p->frame = frame;
+    p->recon = frame != NULL && p->pct == 1;
+    p->mipf = s->mipf_enable_flag;
+    p->patch_qp = hls->pps.fixed_picture_qp_flag ? hls->ph.picture_qp : hls->patch.patch_qp;
+    p->prev_cu_qp = p->lcu_qp = p->patch_qp;
+    p->cb_delta = hls->ph.chroma_quant_param_disable_flag ? 0 : hls->ph.chroma_quant_param_delta_cb;
+    p->cr_delta = hls->ph.chroma_quant_param_disable_flag ? 0 : hls->ph.chroma_quant_param_delta_cr;
     p->scu_stride = (p->pic_w + 3) / 4;
     p->scu = calloc((size_t)p->scu_stride * ((p->pic_h + 3) / 4), sizeof(scu_t));
     if (!p->scu) {
@@ -796,6 +1006,14 @@ int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
         return SVAC3_ERR_UNSUPPORTED;       /* several patches per picture */
     }
 
+    if (p->recon) {
+        p->sao = calloc((size_t)p->lcu_w * p->lcu_h, sizeof(*p->sao));
+        if (!p->sao) {
+            free(p->scu);
+            free(p);
+            return SVAC3_ERR_INVALID;
+        }
+    }
     svac3_ctx_init(p->ctx, SVAC3_NUM_CTX);
     svac3_aec_init(&p->aec, data + hls->patch.aec_data_offset,
                    len - hls->patch.aec_data_offset, s->maec_enable_flag, p->pct);
@@ -816,11 +1034,13 @@ int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
                     break;
             }
             prev_dqp = (sym & 1) ? (sym + 1) / 2 : -(sym / 2);
+            p->lcu_qp = (((p->lcu_qp + prev_dqp) % 64) + 64) % 64;
         }
         if (s->sao_enable_flag && (hls->patch.patch_sao_enable_flag[0] ||
                                    hls->patch.patch_sao_enable_flag[1] ||
                                    hls->patch.patch_sao_enable_flag[2]))
-            parse_sao(p, lx, ly, hls->patch.patch_sao_enable_flag);
+            parse_sao(p, lx, ly, hls->patch.patch_sao_enable_flag,
+                      p->sao ? p->sao[l] : (svac3_sao_t[3]){ { 0 } });
         p->component = 0;
         coding_unit_tree(p, lx * p->lcu_size, ly * p->lcu_size, 0, p->lcu_size, p->lcu_size,
                          1, PRED_NO_CONSTRAINT);
@@ -841,6 +1061,10 @@ int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
     }
     st->bytes_used = svac3_aec_bytes_read(&p->aec);
     st->overrun_bits = p->aec.overrun;
+
+    if (p->recon && st->stuffing_ok)
+        loop_filters(p, hls);
+    free(p->sao);
     free(p->scu);
     free(p);
     return SVAC3_OK;

@@ -14,6 +14,7 @@
 
 #include "svac3_aec.h"
 #include "svac3_hls.h"
+#include "svac3_recon.h"
 
 #define SVAC3_NUM_CTX 445
 
@@ -35,5 +36,11 @@ int svac3_patch_supported(const svac3_hls_t *hls);
  * hls->patch.aec_data_offset. */
 int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
                       svac3_patch_stats_t *stats);
+
+/* As svac3_patch_parse(), and also reconstruct the patch into frame,
+ * including deblocking and SAO. Only I pictures are reconstructed so far;
+ * for other pictures frame is left untouched. */
+int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
+                       svac3_frame_t *frame, svac3_patch_stats_t *stats);
 
 #endif /* SVAC3_PATCH_H */

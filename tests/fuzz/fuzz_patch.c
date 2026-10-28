@@ -1,11 +1,12 @@
 /* SPDX-License-Identifier: BSD-3-Clause
  * Copyright (c) 2026 OpenIPC contributors
  *
- * libFuzzer target for the SVAC3 patch parser: every patch NAL unit that
- * follows a valid SPS, PPS and picture header is parsed.
+ * libFuzzer target for the SVAC3 patch decoder: every patch NAL unit that
+ * follows a valid SPS, PPS and picture header is parsed and, for I
+ * pictures, reconstructed and loop-filtered.
  * Build: clang -g -O1 -fsanitize=fuzzer,address,undefined -Isource/svac3 \
- *          tests/fuzz/fuzz_patch.c source/svac3/svac3_hls.c \
- *          source/svac3/svac3_aec.c source/svac3/svac3_patch.c
+ *          tests/fuzz/fuzz_patch.c source/svac3/svac3_hls.c source/svac3/svac3_aec.c \
+ *          source/svac3/svac3_patch.c source/svac3/svac3_recon.c source/svac3/svac3_loopfilter.c
  */
 #include <stdlib.h>
 #include <string.h>
@@ -33,7 +34,19 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
             continue;
         svac3_patch_stats_t st;
         size_t rl = svac3_unescape(nal + 2, nal_len - 2, rbsp);
-        svac3_patch_parse(&hls, rbsp, rl, &st);
+        const int W = hls.sps.pic_width_in_luma, H = hls.sps.pic_height_in_luma;
+        uint8_t *pix = malloc((size_t)W * H * 3 / 2 + 1);
+        if (!pix)
+            continue;
+        memset(pix, 128, (size_t)W * H * 3 / 2);
+        svac3_frame_t fr = {
+            .plane = { pix, pix + (size_t)W * H, pix + (size_t)W * H * 5 / 4 },
+            .stride = { W, W / 2, W / 2 },
+            .width = { W, W / 2, W / 2 },
+            .height = { H, H / 2, H / 2 },
+        };
+        svac3_patch_decode(&hls, rbsp, rl, &fr, &st);
+        free(pix);
     }
     free(rbsp);
     return 0;

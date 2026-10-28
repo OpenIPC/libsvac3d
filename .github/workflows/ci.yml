@@ -42,7 +42,8 @@ jobs:
           F="-g -O1 -fsanitize=fuzzer,address,undefined -fno-sanitize-recover=undefined -Isource/svac3"
           clang $F tests/fuzz/fuzz_hls.c source/svac3/svac3_hls.c -o fuzz_hls
           clang $F tests/fuzz/fuzz_patch.c source/svac3/svac3_hls.c source/svac3/svac3_aec.c \
-            source/svac3/svac3_patch.c -o fuzz_patch
+            source/svac3/svac3_patch.c source/svac3/svac3_recon.c source/svac3/svac3_loopfilter.c \
+            -o fuzz_patch
       - name: Fuzz the header parser for 60 s
         run: |
           mkdir -p corpus
