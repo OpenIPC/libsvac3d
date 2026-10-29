@@ -1520,8 +1520,11 @@ static int filter_setup(svac3_picture_t *pic, const svac3_hls_t *hls)
         .cb_delta = r->cb_delta, .cr_delta = r->cr_delta,
     };
     pic->dbk = d;
-    /* rows complete in order only when patches span the picture's width */
-    pic->wavefront = (uint64_t)r->sps->patch_width_minus1 + 1 >= (uint64_t)r->lcu_w;
+    /* rows complete in order only when patches span the picture's width;
+     * and LCUs under 16 rows would put band boundaries between chroma
+     * edges, which nothing in the corpus exercises: those filter at the end */
+    pic->wavefront = (uint64_t)r->sps->patch_width_minus1 + 1 >= (uint64_t)r->lcu_w &&
+                     r->lcu_size >= 16;
     return SVAC3_OK;
 }
 

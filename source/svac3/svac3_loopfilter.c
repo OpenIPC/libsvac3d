@@ -81,7 +81,8 @@ static void plane_edges(svac3_frame_t *f, const svac3_dbk_info_t *d, int c, int 
      * positions of horizontal ones */
     if (b1 > H)
         b1 = H;
-    const int e0 = ver ? 8 : (b0 > 8 ? b0 : 8), e1 = ver ? W : b1;
+    /* horizontal edges lie on multiples of 8: the first at or after b0 */
+    const int e0 = ver ? 8 : (b0 > 8 ? (b0 + 7) & ~7 : 8), e1 = ver ? W : b1;
     const int a0 = ver ? b0 : 0, a1 = ver ? b1 : W;
     for (int e = e0; e < e1; e += 8)                     /* the edge's position */
         for (int a = a0; a < a1; a += 8) {               /* along it */

@@ -35,9 +35,8 @@ typedef struct {
 void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d, svac3_pool_t *pool);
 
 /* The same for luma rows [y0, y1) and the chroma rows under them: their
- * vertical edges, then the horizontal edges positioned in them. y0 and y1
- * are multiples of 16; called on consecutive ranges from the top, the
- * result is that of svac3_deblock(). The info covers the rows' units and
+ * vertical edges, then the horizontal edges positioned in them; called on
+ * consecutive ranges from the top, the result is that of svac3_deblock(). The info covers the rows' units and
  * the row of units above. */
 void svac3_deblock_rows(svac3_frame_t *f, const svac3_dbk_info_t *d, int y0, int y1,
                         svac3_pool_t *pool);
