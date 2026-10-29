@@ -310,17 +310,6 @@ static int parse_scan_region(parser_t *p, int ctx_start, int M, int is_chroma)
     return min_in_group[count] + v;
 }
 
-static int pos_class(int px, int py, int srx, int sry, int intra)
-{
-    if (intra) {
-        int i = (px <= srx / 2) ? (px <= srx / 4 ? 0 : 1) : (px <= srx * 3 / 4 ? 2 : 3);
-        int j = (py <= sry / 2) ? (py <= sry / 4 ? 0 : 1) : (py <= sry * 3 / 4 ? 2 : 3);
-        int s = i + j;
-        return s <= 1 ? 4 : s > 2 ? 8 : 12;
-    }
-    return (px <= srx / 2 && py <= sry / 2) ? 4 : 8;
-}
-
 static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra, int16_t *out)
 {
     int16_t *order = p->order;
@@ -332,7 +321,7 @@ static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra
     const int srx = parse_scan_region(p, CTX_SCAN_REGION_X, w, is_chroma);
     const int sry = parse_scan_region(p, CTX_SCAN_REGION_Y, h, is_chroma);
     if (srx >= w || sry >= h) {
-        p->aec.overrun += 1;                 /* impossible region: mark corrupt */
+        svac3_aec_mark_corrupt(&p->aec);     /* impossible region */
         return;
     }
 
@@ -362,11 +351,27 @@ static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra
         }
     }
 
+    /* pos_class() of every position in the scan region, from the zone of
+     * its column and of its row (fixed for the block) */
+    uint8_t zx[64 + 16], zy[64 + 16];          /* room for a vectorised store */
+    for (int x = 0; x <= srx && x < 64; x++)
+        zx[x] = (uint8_t)(intra ? (x <= srx / 2 ? (x <= srx / 4 ? 0 : 1) : (x <= srx * 3 / 4 ? 2 : 3))
+                                : x > srx / 2);
+    for (int y = 0; y <= sry && y < 64; y++)
+        zy[y] = (uint8_t)(intra ? (y <= sry / 2 ? (y <= sry / 4 ? 0 : 1) : (y <= sry * 3 / 4 ? 2 : 3))
+                                : y > sry / 2);
+    static const uint8_t intra_cls[7] = { 4, 4, 12, 8, 8, 8, 8 };   /* by zone sum */
+#define POS_CLASS(px, py) (intra ? intra_cls[zx[px] + zy[py]] : (zx[px] | zy[py]) ? 8 : 4)
+
     const int last_pos = (srx + 1) * (sry + 1) - 1;
     const int last_set = last_pos >> 4;
     const int area = (srx + 1) * (sry + 1);
     int is_last_x = 0, is_last_y = 0, first_done = 0;
-    int pre_gt0[5] = { 0 }, pre_gtx[5] = { 0 };
+    /* the last five coefficients scanned, as 5-bit masks (bit 0 the most
+     * recent): significant, level > 1, level > 2 */
+    unsigned m_sig = 0, m_gt1 = 0, m_gt2 = 0;
+    static const uint8_t ones[32] = { 0, 1, 1, 2, 1, 2, 2, 3, 1, 2, 2, 3, 2, 3, 3, 4,
+                                      1, 2, 2, 3, 2, 3, 3, 4, 2, 3, 3, 4, 3, 4, 4, 5 };
 
     for (int s = last_set; s >= 0; s--) {
         const int set_pos = s << 4;
@@ -383,10 +388,8 @@ static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra
                 int inc = is_chroma ? 51 : (area <= 4 ? 0 : (17 << (area <= 16 ? 0 : 1)));
                 if (px != srx || py != sry) {
                     if (px || py)
-                        inc += is_chroma ? 4 : pos_class(px, py, srx, sry, intra);
-                    int num = 0;
-                    for (int j = 0; j < 5; j++)
-                        num += pre_gt0[j] != 0;
+                        inc += is_chroma ? 4 : POS_CLASS(px, py);
+                    const int num = ones[m_sig];
                     inc += (num < 3 ? num : 3) + 1;
                 }
                 f = bin(p, CTX_SIG + inc);
@@ -399,9 +402,7 @@ static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra
                     is_last_y = 1;
                 nz++;
             }
-            for (int j = 4; j > 0; j--)
-                pre_gt0[j] = pre_gt0[j - 1];
-            pre_gt0[0] = f;
+            m_sig = ((m_sig << 1) | (unsigned)f) & 31;
         }
 
         if (!nz)
@@ -414,14 +415,12 @@ static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra
             const int px = bp & (w - 1), py = bp >> log2w;
             int base = is_chroma ? 17 : 0, cls = 0;
             if (first_done && !is_chroma && (px || py))
-                cls = pos_class(px, py, srx, sry, intra);
+                cls = POS_CLASS(px, py);
             int a;
             for (int k = 1;; k = 2) {
                 int inc = base;
                 if (first_done) {
-                    int num = 0;
-                    for (int j = 0; j < 5; j++)
-                        num += pre_gtx[j] > k;
+                    const int num = ones[k == 1 ? m_gt1 : m_gt2];
                     inc += cls + (num < 3 ? num : 3) + 1;
                 }
                 int g = bin(p, CTX_GT + inc);
@@ -439,9 +438,8 @@ static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra
             }
             absv[bp] = (uint16_t)a;
             first_done = 1;
-            for (int j = 4; j > 0; j--)
-                pre_gtx[j] = pre_gtx[j - 1];
-            pre_gtx[0] = a;
+            m_gt1 = ((m_gt1 << 1) | (unsigned)(a > 1)) & 31;
+            m_gt2 = ((m_gt2 << 1) | (unsigned)(a > 2)) & 31;
         }
         if (escape) {
             for (int n = top; n >= 0; n--) {
@@ -462,6 +460,7 @@ static void parse_srcc_block(parser_t *p, int w, int h, int is_chroma, int intra
         }
     }
     p->st->coded_blocks++;
+#undef POS_CLASS
 }
 
 /* ------------------------------------------------------------------------ */
@@ -1399,7 +1398,7 @@ static int decode_patch(parser_t *p, const svac3_hls_t *hls, const uint8_t *data
                 st->first_bad_lcu = (unsigned)l;
             st->stuffing_ok = 0;
         }
-        if (p->aec.overrun > 64) {
+        if (svac3_aec_overrun(&p->aec) > 64) {
             /* ran out of data: out of sync or truncated, stop here */
             if (st->stuffing_ok)
                 st->first_bad_lcu = (unsigned)l;
@@ -1408,7 +1407,7 @@ static int decode_patch(parser_t *p, const svac3_hls_t *hls, const uint8_t *data
         }
     }
     st->bytes_used = svac3_aec_bytes_read(&p->aec);
-    st->overrun_bits = p->aec.overrun;
+    st->overrun_bits = svac3_aec_overrun(&p->aec);
     return SVAC3_OK;
 }
 

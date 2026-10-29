@@ -360,6 +360,10 @@ void svac3_dequant_itrans(const int16_t *quant, int M1, int M2, int qp, int16_t 
      * and contribute nothing to either pass */
     int nx = 0, ny = 0;
     for (int i = 0; i < M1 * M2; i++) {
+        if (!quant[i]) {                      /* most of them */
+            coef[i] = 0;
+            continue;
+        }
         /* flat weights: (q * 64) >> WqmShift(2) == q * 16 */
         int64_t v = ((((int64_t)quant[i] * 16) * dq_tab[qp]) >> 4);
         v = (v + ((int64_t)1 << (shift - 1))) >> shift;
