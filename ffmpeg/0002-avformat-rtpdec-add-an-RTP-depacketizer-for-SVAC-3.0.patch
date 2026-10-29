@@ -1,0 +1,232 @@
+From 1f53eb76dfc19c220a84622c192074ab056d6db7 Mon Sep 17 00:00:00 2001
+From: Dmitry Ilyin <d.ilyin@openipc.org>
+Date: Thu, 29 Oct 2026 16:25:19 +0300
+Subject: [PATCH] avformat/rtpdec: add an RTP depacketizer for SVAC 3.0
+
+The SVAC 3.0 draft defines a byte stream and no RTP mapping. This reads
+the one OpenIPC cameras send: RFC 7798's shape on SVAC3's two-byte NAL
+header, single NAL unit packets and fragmentation units of type 28,
+with sprop-sps/sprop-pps in the fmtp.
+---
+ libavformat/Makefile         |   1 +
+ libavformat/rtpdec.c         |   1 +
+ libavformat/rtpdec_formats.h |   1 +
+ libavformat/rtpdec_svac3.c   | 170 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 173 insertions(+)
+ create mode 100644 libavformat/rtpdec_svac3.c
+
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index 38e7b3a..a39bf11 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -76,6 +76,7 @@ OBJS-$(CONFIG_RTPDEC)                    += rdt.o                       \
+                                             rtpdec_qdm2.o               \
+                                             rtpdec_qt.o                 \
+                                             rtpdec_rfc4175.o            \
++                                            rtpdec_svac3.o              \
+                                             rtpdec_svq3.o               \
+                                             rtpdec_vc2hq.o              \
+                                             rtpdec_vp8.o                \
+diff --git a/libavformat/rtpdec.c b/libavformat/rtpdec.c
+index 3fd817f..ab76db5 100644
+--- a/libavformat/rtpdec.c
++++ b/libavformat/rtpdec.c
+@@ -93,6 +93,7 @@ static const RTPDynamicProtocolHandler *const rtp_dynamic_protocol_handler_list[
+     &ff_h263_rfc2190_dynamic_handler,
+     &ff_h264_dynamic_handler,
+     &ff_hevc_dynamic_handler,
++    &ff_svac3_dynamic_handler,
+     &ff_ilbc_dynamic_handler,
+     &ff_jpeg_dynamic_handler,
+     &ff_mp4a_latm_dynamic_handler,
+diff --git a/libavformat/rtpdec_formats.h b/libavformat/rtpdec_formats.h
+index 1ff2a72..f882042 100644
+--- a/libavformat/rtpdec_formats.h
++++ b/libavformat/rtpdec_formats.h
+@@ -66,6 +66,7 @@ extern const RTPDynamicProtocolHandler ff_h263_2000_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_h263_rfc2190_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_h264_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_hevc_dynamic_handler;
++extern const RTPDynamicProtocolHandler ff_svac3_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_ilbc_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_jpeg_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_mp4a_latm_dynamic_handler;
+diff --git a/libavformat/rtpdec_svac3.c b/libavformat/rtpdec_svac3.c
+new file mode 100644
+index 0000000..b624779
+--- /dev/null
++++ b/libavformat/rtpdec_svac3.c
+@@ -0,0 +1,170 @@
++/*
++ * RTP depacketizer for SVAC 3.0 video
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * The SVAC 3.0 draft (plan 20243294-T-312) defines a byte stream and no RTP
++ * mapping. This reads the one OpenIPC cameras send, which is RFC 7798's shape
++ * on SVAC3's two-byte NAL header:
++ *
++ *   0                   1
++ *   0 1 2 3 4 5 6 7 8 9 0 1 2 3 4 5
++ *  +-+---+---+-+---+-----+---------+
++ *  |F|enc|aut|D|LID| TID |  Type   |
++ *  +-+---+---+-+---+-----+---------+
++ *
++ * - a single NAL unit packet is the NAL unit, header included;
++ * - a fragmentation unit has that header with Type = 28 (reserved in the
++ *   draft), then an FU header S|E|R|FuType(5), then a fragment of the NAL
++ *   unit's bytes after its two-byte header.
++ *
++ * SDP: a=rtpmap:<pt> SVAC3/90000, and in fmtp sprop-sps / sprop-pps, the
++ * base64 of whole NAL units.
++ */
++
++#include "libavutil/avstring.h"
++#include "libavutil/mem.h"
++
++#include "avformat.h"
++#include "internal.h"
++#include "rtpdec.h"
++#include "rtpdec_formats.h"
++
++#define SVAC3_PAYLOAD_HEADER_SIZE 2
++#define SVAC3_FU_HEADER_SIZE      1
++#define SVAC3_NAL_FU              28
++
++struct PayloadContext {
++    uint8_t *sps, *pps;
++    int sps_size, pps_size;
++};
++
++static const uint8_t start_sequence[] = { 0x00, 0x00, 0x00, 0x01 };
++
++static av_cold int svac3_sdp_parse_fmtp_config(AVFormatContext *s,
++                                               AVStream *stream,
++                                               PayloadContext *data,
++                                               const char *attr, const char *value)
++{
++    if (!strcmp(attr, "sprop-sps"))
++        return ff_h264_parse_sprop_parameter_sets(s, &data->sps, &data->sps_size,
++                                                  value);
++    if (!strcmp(attr, "sprop-pps"))
++        return ff_h264_parse_sprop_parameter_sets(s, &data->pps, &data->pps_size,
++                                                  value);
++    return 0;
++}
++
++static av_cold int svac3_parse_sdp_line(AVFormatContext *ctx, int st_index,
++                                        PayloadContext *data, const char *line)
++{
++    AVCodecParameters *par;
++    const char *p = line;
++    int ret;
++
++    if (st_index < 0)
++        return 0;
++    par = ctx->streams[st_index]->codecpar;
++
++    if (!av_strstart(p, "fmtp:", &p))
++        return 0;
++
++    ret = ff_parse_fmtp(ctx, ctx->streams[st_index], data, p,
++                        svac3_sdp_parse_fmtp_config);
++    if (ret < 0 || !(data->sps_size + data->pps_size))
++        return ret;
++
++    /* Annex-B, SPS before PPS, as the decoder reads its extradata. Rebuilt
++     * from both sets on every fmtp line and the sets kept until close, so a
++     * sender that puts sprop-sps and sprop-pps on lines of their own still
++     * gives the decoder both. */
++    av_freep(&par->extradata);
++    par->extradata_size = 0;
++    if ((ret = ff_alloc_extradata(par, data->sps_size + data->pps_size)) >= 0) {
++        memcpy(par->extradata, data->sps, data->sps_size);
++        memcpy(par->extradata + data->sps_size, data->pps, data->pps_size);
++    }
++    return ret;
++}
++
++static void svac3_close_context(PayloadContext *data)
++{
++    av_freep(&data->sps);
++    av_freep(&data->pps);
++}
++
++static int svac3_handle_packet(AVFormatContext *ctx, PayloadContext *data,
++                               AVStream *st, AVPacket *pkt, uint32_t *timestamp,
++                               const uint8_t *buf, int len, uint16_t seq,
++                               int flags)
++{
++    const uint8_t *hdr = buf;
++    uint8_t nal_header[2];
++    int first, last, ret;
++
++    if (len < SVAC3_PAYLOAD_HEADER_SIZE + 1) {
++        av_log(ctx, AV_LOG_ERROR, "Too short RTP/SVAC3 packet, got %d bytes\n", len);
++        return AVERROR_INVALIDDATA;
++    }
++    if (buf[0] & 0x80) {
++        av_log(ctx, AV_LOG_ERROR, "RTP/SVAC3 packet with forbidden_zero_bit set\n");
++        return AVERROR_INVALIDDATA;
++    }
++
++    if ((buf[1] & 0x1f) != SVAC3_NAL_FU) {
++        if ((ret = av_new_packet(pkt, sizeof(start_sequence) + len)) < 0)
++            return ret;
++        memcpy(pkt->data, start_sequence, sizeof(start_sequence));
++        memcpy(pkt->data + sizeof(start_sequence), buf, len);
++        pkt->stream_index = st->index;
++        return 0;
++    }
++
++    buf += SVAC3_PAYLOAD_HEADER_SIZE;
++    len -= SVAC3_PAYLOAD_HEADER_SIZE;
++    first = buf[0] & 0x80;
++    last  = buf[0] & 0x40;
++    if (first && last) {
++        av_log(ctx, AV_LOG_ERROR, "Illegal combination of S and E bit in RTP/SVAC3 packet\n");
++        return AVERROR_INVALIDDATA;
++    }
++    /* The NAL unit's own header: the payload header with its type back. */
++    nal_header[0] = hdr[0];
++    nal_header[1] = (hdr[1] & 0xe0) | (buf[0] & 0x1f);
++    buf += SVAC3_FU_HEADER_SIZE;
++    len -= SVAC3_FU_HEADER_SIZE;
++    if (len <= 0)
++        return len < 0 ? AVERROR_INVALIDDATA : AVERROR(EAGAIN);
++
++    ret = ff_h264_handle_frag_packet(pkt, buf, len, first,
++                                     nal_header, sizeof(nal_header));
++    pkt->stream_index = st->index;
++    return ret;
++}
++
++const RTPDynamicProtocolHandler ff_svac3_dynamic_handler = {
++    .enc_name         = "SVAC3",
++    .codec_type       = AVMEDIA_TYPE_VIDEO,
++    .codec_id         = AV_CODEC_ID_SVAC3,
++    .need_parsing     = AVSTREAM_PARSE_FULL,
++    .priv_data_size   = sizeof(PayloadContext),
++    .parse_sdp_a_line = svac3_parse_sdp_line,
++    .close            = svac3_close_context,
++    .parse_packet     = svac3_handle_packet,
++};
+-- 
+2.54.0
+
