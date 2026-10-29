@@ -95,6 +95,7 @@ typedef struct {
     svac3_tmv_t *tmv_out;
     svac3_pool_t *pool;          /* threads for the loop filters, or NULL */
     struct svac3_picture *pic;   /* parsing: where coding-unit records go */
+    struct svac3_picture *owner; /* reconstruction: the picture, for the loop filters */
 
     /* scratch for one transform block */
     int16_t order[64 * 64];
@@ -737,7 +738,7 @@ static void recon_chroma_inter(parser_t *p, int x0, int y0, int w, int h, int qp
  * means reconstructed) consumes them in order, on the same thread or on
  * one of its own. */
 
-enum { REC_CU, REC_CHROMA, REC_PATCH };
+enum { REC_CU, REC_CHROMA, REC_PATCH, REC_ROW };
 
 typedef struct {
     uint8_t kind;
@@ -745,6 +746,7 @@ typedef struct {
     uint8_t group_start;         /* the CU opens a QP group */
     uint8_t lcu_qp;
     uint8_t patch, patch_qp, fixed_qp;   /* REC_PATCH */
+    uint16_t row;                /* REC_ROW: this LCU row is done */
     int16_t dqp;
     int32_t mvd[2];              /* as parsed: derive_mvp() clips the sum */
     uint16_t x0, y0, w, h;
@@ -752,6 +754,7 @@ typedef struct {
 } cu_rec_t;
 
 static void emit(parser_t *p, cu_rec_t *rec);
+static void filter_rows_done(struct svac3_picture *pic, int rows);
 
 static void cu_recon_chroma(parser_t *r, const cu_rec_t *rec)
 {
@@ -857,6 +860,9 @@ static void recon_rec(parser_t *r, const cu_rec_t *rec)
         break;
     case REC_CHROMA:
         cu_recon_chroma(r, rec);
+        break;
+    case REC_ROW:
+        filter_rows_done(r->owner, rec->row + 1);
         break;
     }
 }
@@ -1157,53 +1163,6 @@ static void coding_unit_tree(parser_t *p, int x0, int y0, int split, int w, int 
 
 /* ------------------------------------------------------------------------ */
 
-static int loop_filters(parser_t *p, const svac3_hls_t *hls)
-{
-    const size_t n = (size_t)p->scu_stride * ((p->pic_h + 3) / 4);
-    uint32_t *id = malloc(n * sizeof(*id));
-    uint8_t *qp = malloc(n), *cbf = malloc(n);
-    int8_t *ref = malloc(n);
-    int16_t *mv = malloc(n * 2 * sizeof(*mv));
-
-    if (!id || !qp || !cbf || !ref || !mv) {
-        free(id);
-        free(qp);
-        free(cbf);
-        free(ref);
-        free(mv);
-        return SVAC3_ERR_NOMEM;
-    }
-    if (!hls->pps.deblocking_filter_disable_flag) {
-        for (size_t i = 0; i < n; i++) {
-            id[i] = p->scu[i].cu_id;
-            qp[i] = p->scu[i].qp;
-            cbf[i] = p->scu[i].cbf;
-            ref[i] = p->scu[i].intra ? -1 : p->scu[i].ref;
-            mv[2 * i] = p->scu[i].mv[0];
-            mv[2 * i + 1] = p->scu[i].mv[1];
-        }
-        svac3_dbk_info_t d = {
-            .pic_w = p->pic_w, .pic_h = p->pic_h, .stride = p->scu_stride,
-            .cu_id = id, .qp = qp,
-            .inter = p->pct != 1, .cbf = cbf, .ref = ref, .mv = mv,
-            .alpha_offset = hls->ph.alpha_c_offset, .beta_offset = hls->ph.beta_offset,
-            .filter_type = hls->pps.deblocking_filter_type,
-            .cb_delta = p->cb_delta, .cr_delta = p->cr_delta,
-        };
-        svac3_deblock(p->frame, &d, p->pool);
-    }
-    free(id);
-    free(qp);
-    free(cbf);
-    free(ref);
-    free(mv);
-    if (p->sps->sao_enable_flag)
-        return svac3_sao(p->frame, (const svac3_sao_t (*)[3])p->sao, p->lcu_size, p->lcu_w, p->lcu_h,
-                         p->pool)
-               ? SVAC3_ERR_NOMEM : SVAC3_OK;
-    return SVAC3_OK;
-}
-
 /* A frame for reconstruction must hold the coded picture, 4:2:0. */
 static int frame_ok(const svac3_frame_t *f, int w, int h)
 {
@@ -1354,6 +1313,27 @@ struct svac3_picture {
     int tail_n;                  /* records in rec_tail */
     long produced, published;
     int ending;                  /* every record is published: the worker stops */
+
+    /* loop filters: deblocking in LCU-row bands one row behind the
+     * reconstruction (a band's bottom samples are the next row's intra
+     * references), SAO one band behind that, from a copy of the deblocked
+     * rows it reads; with patches narrower than the picture, at the end */
+    int wavefront;
+    int dbk_off, sao_on;
+    /* with 3 threads or more, the filters have a thread of their own */
+    int filter_threaded, filter_ending, rows_ready;
+    pthread_t filter;
+    pthread_mutex_t flock;
+    pthread_cond_t fready;
+    svac3_dbk_info_t dbk;
+    int dbk_done, sao_done, copied[3];
+    uint8_t *sao_src[3];         /* deblocked samples SAO reads, frame layout */
+    uint8_t *sao_buf;
+    size_t sao_buf_n, unit_n;
+    uint32_t *u_id;
+    uint8_t *u_qp, *u_cbf;
+    int8_t *u_ref;
+    int16_t *u_mv;
     coef_chunk_t *coef_head, *coef_tail;
 
     /* kept for the next picture of a cache: spare chunks, buffer sizes */
@@ -1361,6 +1341,192 @@ struct svac3_picture {
     coef_chunk_t *coef_spare;
     size_t scu_n, sao_n;
 };
+
+/* The deblocking parameters of LCU row k's units */
+static void fill_units(svac3_picture_t *pic, int k)
+{
+    const parser_t *r = &pic->r;
+    const int urows = (r->pic_h + 3) / 4, u0 = k * r->lcu_size / 4;
+    int u1 = (k + 1) * r->lcu_size / 4;
+    if (u1 > urows)
+        u1 = urows;
+    for (size_t i = (size_t)u0 * r->scu_stride; i < (size_t)u1 * r->scu_stride; i++) {
+        const scu_t *u = &r->scu[i];
+        pic->u_id[i] = u->cu_id;
+        pic->u_qp[i] = u->qp;
+        pic->u_cbf[i] = u->cbf;
+        pic->u_ref[i] = u->intra ? -1 : u->ref;
+        pic->u_mv[2 * i] = u->mv[0];
+        pic->u_mv[2 * i + 1] = u->mv[1];
+    }
+}
+
+/* Filter what the reconstruction of rows LCU rows allows (all of it when
+ * final): deblocking of band k once row k + 1 is reconstructed, SAO of LCU
+ * row k once band k is deblocked. Called on increasing rows, and the same
+ * result as filtering the whole picture at once. */
+static void filter_upto(svac3_picture_t *pic, int rows, int final)
+{
+    parser_t *r = &pic->r;
+    const int L = r->lcu_size, lh = r->lcu_h;
+    const int dbk_to = final ? lh : rows - 1;
+    /* every ready band in one call: the vertical edges of all their rows,
+     * then the horizontal ones, which is what band after band gives */
+    if (pic->dbk_done < dbk_to) {
+        if (!pic->dbk_off) {
+            for (int k = pic->dbk_done; k < dbk_to; k++)
+                fill_units(pic, k);
+            svac3_deblock_rows(r->frame, &pic->dbk, pic->dbk_done * L, dbk_to * L, r->pool);
+        }
+        pic->dbk_done = dbk_to;
+    }
+    if (!pic->sao_on || pic->sao_done >= pic->dbk_done)
+        return;
+    /* the deblocked rows the SAO of LCU rows sao_done .. dbk_done - 1 reads
+     * that are final now: up to 4 above the next band (whose top edge
+     * changes the 3 above it) */
+    const int k = pic->dbk_done - 1;
+    for (int c = 0; c < 3; c++) {
+        const int Lc = c ? L / 2 : L, Hc = r->frame->height[c], s = r->frame->stride[c];
+        int upto = k == lh - 1 ? Hc : (k + 1) * Lc - 3;
+        if (upto > Hc)
+            upto = Hc;
+        if (upto > pic->copied[c]) {
+            memcpy(pic->sao_src[c] + (size_t)pic->copied[c] * s,
+                   r->frame->plane[c] + (size_t)pic->copied[c] * s,
+                   (size_t)(upto - pic->copied[c]) * s);
+            pic->copied[c] = upto;
+        }
+    }
+    svac3_sao_rows(r->frame, pic->sao_src, (const svac3_sao_t (*)[3])r->sao, L, r->lcu_w, lh,
+                   pic->sao_done, pic->dbk_done, r->pool);
+    pic->sao_done = pic->dbk_done;
+}
+
+/* The reconstruction has finished LCU rows 0 .. rows - 1 */
+static void filter_rows_done(svac3_picture_t *pic, int rows)
+{
+    if (!pic || !pic->wavefront)
+        return;
+    if (!pic->filter_threaded) {
+        filter_upto(pic, rows, 0);
+        return;
+    }
+    pthread_mutex_lock(&pic->flock);
+    pic->rows_ready = rows;
+    pthread_cond_signal(&pic->fready);
+    pthread_mutex_unlock(&pic->flock);
+}
+
+static void *filter_worker(void *arg)
+{
+    svac3_picture_t *pic = arg;
+    int seen = 0;
+    for (;;) {
+        pthread_mutex_lock(&pic->flock);
+        while (pic->rows_ready == seen && !pic->filter_ending)
+            pthread_cond_wait(&pic->fready, &pic->flock);
+        const int rows = pic->rows_ready, last = pic->filter_ending;
+        pthread_mutex_unlock(&pic->flock);
+        if (rows > seen)
+            filter_upto(pic, rows, 0);
+        seen = rows;
+        if (last)
+            return NULL;
+    }
+}
+
+/* Start the filter thread; on failure the filters run on the
+ * reconstruction thread */
+static void start_filter_thread(svac3_picture_t *pic)
+{
+    if (pthread_mutex_init(&pic->flock, NULL))
+        return;
+    if (pthread_cond_init(&pic->fready, NULL)) {
+        pthread_mutex_destroy(&pic->flock);
+        return;
+    }
+    pic->filter_threaded = 1;
+    /* one LCU row has little to share out: the thread works alone */
+    pic->r.pool = NULL;
+    if (pthread_create(&pic->filter, NULL, filter_worker, pic)) {
+        pthread_mutex_destroy(&pic->flock);
+        pthread_cond_destroy(&pic->fready);
+        pic->filter_threaded = 0;
+        pic->r.pool = pic->p.pool;
+    }
+}
+
+/* Stop the filter thread once it has filtered what it was given */
+static void finish_filter_thread(svac3_picture_t *pic)
+{
+    if (!pic->filter_threaded)
+        return;
+    pthread_mutex_lock(&pic->flock);
+    pic->filter_ending = 1;
+    pthread_cond_signal(&pic->fready);
+    pthread_mutex_unlock(&pic->flock);
+    pthread_join(pic->filter, NULL);
+    pthread_mutex_destroy(&pic->flock);
+    pthread_cond_destroy(&pic->fready);
+    pic->filter_threaded = 0;
+    pic->r.pool = pic->p.pool;
+}
+
+/* Buffers for the loop filters of a picture of r's size, reused from the
+ * cache's picture when they fit */
+static int filter_setup(svac3_picture_t *pic, const svac3_hls_t *hls)
+{
+    parser_t *r = &pic->r;
+    const size_t n = (size_t)r->scu_stride * ((r->pic_h + 3) / 4);
+    pic->dbk_off = hls->pps.deblocking_filter_disable_flag;
+    pic->sao_on = r->sps->sao_enable_flag;
+    if (pic->unit_n != n) {
+        free(pic->u_id);
+        free(pic->u_qp);
+        free(pic->u_cbf);
+        free(pic->u_ref);
+        free(pic->u_mv);
+        pic->u_id = malloc(n * sizeof(*pic->u_id));
+        pic->u_qp = malloc(n);
+        pic->u_cbf = malloc(n);
+        pic->u_ref = malloc(n);
+        pic->u_mv = malloc(n * 2 * sizeof(*pic->u_mv));
+        pic->unit_n = (pic->u_id && pic->u_qp && pic->u_cbf && pic->u_ref && pic->u_mv) ? n : 0;
+        if (!pic->unit_n)
+            return SVAC3_ERR_NOMEM;
+    }
+    const svac3_frame_t *f = r->frame;
+    const size_t fs = (size_t)f->stride[0] * f->height[0] + (size_t)f->stride[1] * f->height[1] +
+                      (size_t)f->stride[2] * f->height[2];
+    if (pic->sao_on && pic->sao_buf_n < fs) {
+        free(pic->sao_buf);
+        pic->sao_buf = malloc(fs);
+        pic->sao_buf_n = pic->sao_buf ? fs : 0;
+        if (!pic->sao_buf)
+            return SVAC3_ERR_NOMEM;
+    }
+    if (pic->sao_on) {
+        pic->sao_src[0] = pic->sao_buf;
+        pic->sao_src[1] = pic->sao_src[0] + (size_t)f->stride[0] * f->height[0];
+        pic->sao_src[2] = pic->sao_src[1] + (size_t)f->stride[1] * f->height[1];
+    }
+    svac3_dbk_info_t d = {
+        .pic_w = r->pic_w, .pic_h = r->pic_h, .stride = r->scu_stride,
+        .cu_id = pic->u_id, .qp = pic->u_qp,
+        .inter = r->pct != 1, .cbf = pic->u_cbf, .ref = pic->u_ref, .mv = pic->u_mv,
+        .alpha_offset = hls->ph.alpha_c_offset, .beta_offset = hls->ph.beta_offset,
+        .filter_type = hls->pps.deblocking_filter_type,
+        .cb_delta = r->cb_delta, .cr_delta = r->cr_delta,
+    };
+    pic->dbk = d;
+    /* rows complete in order only when patches span the picture's width;
+     * and LCUs under 16 rows would put band boundaries between chroma
+     * edges, which nothing in the corpus exercises: those filter at the end */
+    pic->wavefront = (uint64_t)r->sps->patch_width_minus1 + 1 >= (uint64_t)r->lcu_w &&
+                     r->lcu_size >= 16;
+    return SVAC3_OK;
+}
 
 /* A copy of n coefficients in the picture's chunks, or NULL */
 static const int16_t *keep_coefs(svac3_picture_t *pic, const int16_t *c, size_t n)
@@ -1475,6 +1641,7 @@ static void finish_worker(svac3_picture_t *pic)
     pthread_mutex_destroy(&pic->lock);
     pthread_cond_destroy(&pic->ready);
     pic->threaded = 0;
+    finish_filter_thread(pic);
 }
 
 int svac3_picture_patches(const svac3_hls_t *hls)
@@ -1526,6 +1693,12 @@ void svac3_picture_free(svac3_picture_t *pic)
     free(pic->p.sao);
     free(pic->p.scu);
     free(pic->r.scu);
+    free(pic->sao_buf);
+    free(pic->u_id);
+    free(pic->u_qp);
+    free(pic->u_cbf);
+    free(pic->u_ref);
+    free(pic->u_mv);
     free(pic);
 }
 
@@ -1569,7 +1742,21 @@ static svac3_picture_t *take_picture(svac3_picture_cache_t *cache)
     rec_chunk_t *rsp = pic->rec_spare;
     coef_chunk_t *csp = pic->coef_spare;
     const size_t scu_n = pic->scu_n, sao_n = pic->sao_n;
+    uint8_t *sbuf = pic->sao_buf;
+    const size_t sbuf_n = pic->sao_buf_n, unit_n = pic->unit_n;
+    uint32_t *uid = pic->u_id;
+    uint8_t *uqp = pic->u_qp, *ucbf = pic->u_cbf;
+    int8_t *uref = pic->u_ref;
+    int16_t *umv = pic->u_mv;
     memset(pic, 0, sizeof(*pic));
+    pic->sao_buf = sbuf;
+    pic->sao_buf_n = sbuf_n;
+    pic->unit_n = unit_n;
+    pic->u_id = uid;
+    pic->u_qp = uqp;
+    pic->u_cbf = ucbf;
+    pic->u_ref = uref;
+    pic->u_mv = umv;
     pic->p.scu = ps;
     pic->r.scu = rs;
     pic->p.sao = sao;
@@ -1669,7 +1856,12 @@ int svac3_picture_begin_cached(const svac3_hls_t *hls, svac3_frame_t *frame,
         scu_t *rs = r->scu;                     /* cleared above */
         memcpy(r, p, sizeof(*r));
         r->pic = NULL;
+        r->owner = pic;
         r->scu = rs;
+        if (filter_setup(pic, hls)) {
+            svac3_picture_free(pic);
+            return SVAC3_ERR_NOMEM;
+        }
     }
     *out = pic;
     return SVAC3_OK;
@@ -1743,6 +1935,10 @@ static int decode_patch(parser_t *p, const svac3_hls_t *hls, const uint8_t *data
                          1, PRED_NO_CONSTRAINT);
         const int stuff = svac3_aec_stuffing_bit(&p->aec);
         st->lcus++;
+        if (p->pic && p->pic->wavefront && i % pcols == pcols - 1) {
+            cu_rec_t row = { .kind = REC_ROW, .row = (uint16_t)ly };
+            emit(p, &row);
+        }
         if (p->pic && p->pic->threaded)
             publish(p->pic);                    /* an LCU's records at a time */
         if (stuff != (i == n_lcu - 1)) {
@@ -1775,10 +1971,18 @@ void svac3_picture_set_pool(svac3_picture_t *pic, svac3_pool_t *pool)
             return;
         }
         pic->threaded = 1;
+        /* 3 threads or more: the filters follow the reconstruction on a
+         * thread of their own. With 2, filtering the whole picture on both
+         * at the end does better than adding it to the reconstruction's. */
+        if (pic->wavefront && svac3_pool_threads(pool) >= 3)
+            start_filter_thread(pic);
+        else
+            pic->wavefront = 0;
         if (pthread_create(&pic->worker, NULL, recon_worker, pic)) {
             pthread_mutex_destroy(&pic->lock);
             pthread_cond_destroy(&pic->ready);
             pic->threaded = 0;
+            finish_filter_thread(pic);
         }
     }
 }
@@ -1821,7 +2025,7 @@ int svac3_picture_end_cached(svac3_picture_t *pic, const svac3_hls_t *hls,
     else if (pic->failed)
         ret = SVAC3_ERR_NOMEM;
     else if (p->recon)
-        ret = loop_filters(&pic->r, hls);
+        filter_upto(pic, 0, 1);                 /* what the rows left to filter */
     if (ret == SVAC3_OK && p->tmv_out)
         store_tmv(p->recon ? &pic->r : p, p->tmv_out);
     svac3_picture_release(pic, cache);

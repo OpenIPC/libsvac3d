@@ -81,7 +81,8 @@ static void plane_edges(svac3_frame_t *f, const svac3_dbk_info_t *d, int c, int 
      * positions of horizontal ones */
     if (b1 > H)
         b1 = H;
-    const int e0 = ver ? 8 : (b0 > 8 ? b0 : 8), e1 = ver ? W : b1;
+    /* horizontal edges lie on multiples of 8: the first at or after b0 */
+    const int e0 = ver ? 8 : (b0 > 8 ? (b0 + 7) & ~7 : 8), e1 = ver ? W : b1;
     const int a0 = ver ? b0 : 0, a1 = ver ? b1 : W;
     for (int e = e0; e < e1; e += 8)                     /* the edge's position */
         for (int a = a0; a < a1; a += 8) {               /* along it */
@@ -111,7 +112,7 @@ typedef struct {
     svac3_frame_t *f;
     const svac3_dbk_info_t *d;
     const svac3_dsp_t *dsp;
-    int ver, bands[3];
+    int ver, bands[3], y0[3], y1[3];
 } dbk_job_t;
 
 static void dbk_band(void *arg, int i)
@@ -122,23 +123,33 @@ static void dbk_band(void *arg, int i)
         i -= j->bands[c];
         c++;
     }
-    const int h = c ? BAND / 2 : BAND;
-    plane_edges(j->f, j->d, c, j->ver, j->dsp, i * h, (i + 1) * h);
+    const int h = c ? BAND / 2 : BAND, b0 = j->y0[c] + i * h;
+    plane_edges(j->f, j->d, c, j->ver, j->dsp, b0, b0 + h < j->y1[c] ? b0 + h : j->y1[c]);
 }
 
-void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d, svac3_pool_t *pool)
+void svac3_deblock_rows(svac3_frame_t *f, const svac3_dbk_info_t *d, int y0, int y1,
+                        svac3_pool_t *pool)
 {
     dbk_job_t j = { .f = f, .d = d, .dsp = svac3_dsp() };
+    if (y1 > f->height[0])
+        y1 = f->height[0];
     for (int c = 0; c < 3; c++) {
         const int h = c ? BAND / 2 : BAND;
-        j.bands[c] = (f->height[c] + h - 1) / h;
+        j.y0[c] = c ? y0 / 2 : y0;
+        j.y1[c] = c ? (y1 == f->height[0] ? f->height[c] : y1 / 2) : y1;
+        j.bands[c] = j.y1[c] > j.y0[c] ? (j.y1[c] - j.y0[c] + h - 1) / h : 0;
     }
     const int n = j.bands[0] + j.bands[1] + j.bands[2];
-    /* all the vertical edges of the picture, then all the horizontal ones */
+    /* the vertical edges of the rows, then the horizontal ones */
     j.ver = 1;
     svac3_pool_run(pool, dbk_band, &j, n);
     j.ver = 0;
     svac3_pool_run(pool, dbk_band, &j, n);
+}
+
+void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d, svac3_pool_t *pool)
+{
+    svac3_deblock_rows(f, d, 0, f->height[0], pool);
 }
 
 /* ------------------------------------------------------------------------ */
@@ -150,6 +161,7 @@ typedef struct {
     const svac3_sao_t (*sao)[3];
     const svac3_dsp_t *dsp;
     int c, W, H, s, L, lcu_w, lcu_h;
+    int row0;                    /* sao_row_at(): the first LCU row */
 } sao_job_t;
 
 /* One row of LCUs of one component: SAO reads the deblocked copy, so rows
@@ -207,21 +219,47 @@ static void sao_row(void *arg, int ly)
     }
 }
 
-int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size, int lcu_w, int lcu_h,
-              svac3_pool_t *pool)
+static void sao_row_at(void *arg, int i)
+{
+    const sao_job_t *j = arg;
+    sao_row(arg, j->row0 + i);
+}
+
+void svac3_sao_rows(svac3_frame_t *f, uint8_t *const src[3], const svac3_sao_t (*sao)[3],
+                    int lcu_size, int lcu_w, int lcu_h, int r0, int r1, svac3_pool_t *pool)
 {
     const svac3_dsp_t *dsp = svac3_dsp();
     for (int c = 0; c < 3; c++) {
-        const int W = f->width[c], H = f->height[c], s = f->stride[c];
         const int L = c ? lcu_size / 2 : lcu_size;
-        uint8_t *src = malloc((size_t)s * H);   /* SAO reads deblocked samples */
-        if (!src)
-            return -1;
-        memcpy(src, f->plane[c], (size_t)s * H);
-        sao_job_t j = { .dst = f->plane[c], .src = src, .sao = sao, .dsp = dsp, .c = c,
-                        .W = W, .H = H, .s = s, .L = L, .lcu_w = lcu_w, .lcu_h = lcu_h };
-        svac3_pool_run(pool, sao_row, &j, lcu_h);
-        free(src);
+        sao_job_t j = { .dst = f->plane[c], .src = src[c], .sao = sao, .dsp = dsp, .c = c,
+                        .W = f->width[c], .H = f->height[c], .s = f->stride[c], .L = L,
+                        .lcu_w = lcu_w, .lcu_h = lcu_h };
+        /* sao_row() reads the rows it needs from src, at the frame's offsets */
+        for (int r = r0; r < r1; r += 64) {
+            const int n = r1 - r < 64 ? r1 - r : 64;
+            sao_job_t jj = j;
+            jj.row0 = r;
+            svac3_pool_run(pool, sao_row_at, &jj, n);
+        }
     }
+}
+
+int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size, int lcu_w, int lcu_h,
+              svac3_pool_t *pool)
+{
+    uint8_t *src[3];
+    for (int c = 0; c < 3; c++) {
+        const size_t n = (size_t)f->stride[c] * f->height[c];
+        src[c] = malloc(n);                     /* SAO reads deblocked samples */
+        if (!src[c]) {
+            while (c--)
+                free(src[c]);
+            return -1;
+        }
+        memcpy(src[c], f->plane[c], n);
+    }
+    svac3_sao_rows(f, src, sao, lcu_size, lcu_w, lcu_h, 0, lcu_h, pool);
+    for (int c = 0; c < 3; c++)
+        free(src[c]);
     return 0;
 }
