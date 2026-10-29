@@ -13,21 +13,21 @@ tool set of the GB/T SVAC 3.0 draft.
  libavcodec/allcodecs.c    |   1 +
  libavcodec/codec_desc.c   |   7 ++
  libavcodec/codec_id.h     |   1 +
- libavcodec/libsvac3d.c    | 203 ++++++++++++++++++++++++++++++++++++++
+ libavcodec/libsvac3d.c    | 206 ++++++++++++++++++++++++++++++++++++++
  libavcodec/parsers.c      |   1 +
  libavcodec/svac3.h        |  56 +++++++++++
- libavcodec/svac3_parser.c | 121 +++++++++++++++++++++++
+ libavcodec/svac3_parser.c | 121 ++++++++++++++++++++++
  libavformat/Makefile      |   1 +
  libavformat/allformats.c  |   1 +
  libavformat/svac3dec.c    |  64 ++++++++++++
- 12 files changed, 463 insertions(+)
+ 12 files changed, 466 insertions(+)
  create mode 100644 libavcodec/libsvac3d.c
  create mode 100644 libavcodec/svac3.h
  create mode 100644 libavcodec/svac3_parser.c
  create mode 100644 libavformat/svac3dec.c
 
 diff --git a/configure b/configure
-index 374bd5c..830c135 100755
+index 374bd5c..6fd5725 100755
 --- a/configure
 +++ b/configure
 @@ -290,6 +290,7 @@ External library support:
@@ -59,7 +59,7 @@ index 374bd5c..830c135 100755
  enabled libtwolame        && require libtwolame twolame.h twolame_init -ltwolame &&
                               { check_lib libtwolame twolame.h twolame_encode_buffer_float32_interleaved -ltwolame ||
                                 die "ERROR: libtwolame must be installed and version must be >= 0.3.10"; }
-+enabled libsvac3d         && require_pkg_config libsvac3d "libsvac3d >= 0.1.0" svac3d.h svac3d_open
++enabled libsvac3d         && require_pkg_config libsvac3d "libsvac3d >= 0.2.0" svac3d.h svac3d_set_threads
  enabled libuavs3d         && require_pkg_config libuavs3d "uavs3d >= 1.1.41" uavs3d.h uavs3d_decode
  enabled libv4l2           && require_pkg_config libv4l2 libv4l2 libv4l2.h v4l2_ioctl
  enabled libvidstab        && require_pkg_config libvidstab "vidstab >= 0.98" vid.stab/libvidstab.h vsMotionDetectInit
@@ -127,10 +127,10 @@ index 668a068..a089876 100644
      AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs
 diff --git a/libavcodec/libsvac3d.c b/libavcodec/libsvac3d.c
 new file mode 100644
-index 0000000..1e4060b
+index 0000000..e69d957
 --- /dev/null
 +++ b/libavcodec/libsvac3d.c
-@@ -0,0 +1,203 @@
+@@ -0,0 +1,206 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -156,6 +156,7 @@ index 0000000..1e4060b
 +
 +#include <svac3d.h>
 +
++#include "libavutil/cpu.h"
 +#include "libavutil/fifo.h"
 +#include "libavutil/imgutils.h"
 +#include "avcodec.h"
@@ -251,6 +252,8 @@ index 0000000..1e4060b
 +    if (!s->pkt || !s->frames || !s->dec)
 +        return AVERROR(ENOMEM);
 +    avctx->pix_fmt = AV_PIX_FMT_YUV420P;
++    /* libsvac3d runs its own threads: 0 asks for one per CPU */
++    svac3d_set_threads(s->dec, avctx->thread_count > 0 ? avctx->thread_count : av_cpu_count());
 +
 +    /* parameter sets carried out of band */
 +    if (avctx->extradata_size > 0) {
@@ -330,8 +333,8 @@ index 0000000..1e4060b
 +    .close          = libsvac3d_close,
 +    .flush          = libsvac3d_flush,
 +    FF_CODEC_RECEIVE_FRAME_CB(libsvac3d_receive_frame),
-+    .p.capabilities = AV_CODEC_CAP_DR1,
-+    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP,
++    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_OTHER_THREADS,
++    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP | FF_CODEC_CAP_AUTO_THREADS,
 +    .p.wrapper_name = "libsvac3d",
 +};
 diff --git a/libavcodec/parsers.c b/libavcodec/parsers.c

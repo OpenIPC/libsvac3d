@@ -75,6 +75,10 @@ foreach(stream ${SVAC3_TEST_STREAMS})
         add_test(NAME recon_md5_${name}
                  COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/check_md5.py
                          $<TARGET_FILE:svac3dec> ${stream} ${CMAKE_SOURCE_DIR}/tests/golden/${name}.framemd5)
+        # the same pictures from 4 threads
+        add_test(NAME recon_md5_t4_${name}
+                 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/check_md5.py
+                         $<TARGET_FILE:svac3dec> ${stream} ${CMAKE_SOURCE_DIR}/tests/golden/${name}.framemd5 4)
     endif()
 endforeach()
 add_test(NAME hls_dump

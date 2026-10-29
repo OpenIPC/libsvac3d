@@ -44,6 +44,8 @@ struct svac3_dec {
     int open_lib;
     int open_keep[DPB_SLOTS];
     svac3_refs_t open_refs;
+    svac3_pool_t *pool;
+    svac3_picture_cache_t cache;
     int64_t open_doi, open_poi;
     uint32_t open_index;
 };
@@ -76,8 +78,18 @@ void svac3_dec_destroy(svac3_dec_t *d)
         return;
     abandon(d);
     free_pics(d);
+    svac3_picture_cache_free(&d->cache);
+    svac3_pool_destroy(d->pool);
     free(d->rbsp);
     free(d);
+}
+
+int svac3_dec_set_threads(svac3_dec_t *d, int threads)
+{
+    abandon(d);                       /* a picture keeps the pool it began with */
+    svac3_pool_destroy(d->pool);
+    d->pool = svac3_pool_create(threads);
+    return svac3_pool_threads(d->pool);
 }
 
 void svac3_dec_reset(svac3_dec_t *d)
@@ -187,7 +199,7 @@ static int64_t clamp_dist(int64_t dist)
 
 static void abandon(svac3_dec_t *d)
 {
-    svac3_picture_free(d->open);
+    svac3_picture_release(d->open, &d->cache);
     d->open = NULL;
 }
 
@@ -208,8 +220,9 @@ static int start_library(svac3_dec_t *d)
     cur->used = 0;
     if (!cur->buf && (ret = alloc_pic(cur, d->w, d->h)))
         return ret;
-    if ((ret = svac3_picture_begin(hls, &cur->f, NULL, cur->tmv, &d->open)))
+    if ((ret = svac3_picture_begin_cached(hls, &cur->f, NULL, cur->tmv, &d->cache, &d->open)))
         return ret;
+    svac3_picture_set_pool(d->open, d->pool);
     d->open_slot = cur;
     d->open_lib = 1;
     d->open_index = hls->ph.library_picture_index;
@@ -296,8 +309,9 @@ static int start_picture(svac3_dec_t *d)
     cur->used = 0;                              /* its picture is about to be overwritten */
     if (!cur->buf && (ret = alloc_pic(cur, w, h)))
         return ret;
-    if ((ret = svac3_picture_begin(hls, &cur->f, refs, cur->tmv, &d->open)))
+    if ((ret = svac3_picture_begin_cached(hls, &cur->f, refs, cur->tmv, &d->cache, &d->open)))
         return ret;
+    svac3_picture_set_pool(d->open, d->pool);
     d->open_slot = cur;
     d->open_lib = 0;
     return SVAC3_OK;
@@ -352,7 +366,7 @@ static int decode_patch_nal(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
     if (ret == 1) {
         svac3_picture_t *pic = d->open;
         d->open = NULL;
-        if ((ret = svac3_picture_end(pic, hls)))
+        if ((ret = svac3_picture_end_cached(pic, hls, &d->cache)))
             return ret;
         commit(d, out);
     }

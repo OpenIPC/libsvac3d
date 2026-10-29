@@ -15,6 +15,7 @@
 #include "svac3_aec.h"
 #include "svac3_hls.h"
 #include "svac3_recon.h"
+#include "svac3_pool.h"
 
 #define SVAC3_NUM_CTX 445
 
@@ -97,7 +98,27 @@ int svac3_picture_patch(svac3_picture_t *pic, const svac3_hls_t *hls, const uint
 /* Finish and free the picture: SVAC3_ERR_CORRUPT if patches are missing. */
 int svac3_picture_end(svac3_picture_t *pic, const svac3_hls_t *hls);
 
+/* Run the picture's loop filters on pool's threads (NULL: on the caller) */
+void svac3_picture_set_pool(svac3_picture_t *pic, svac3_pool_t *pool);
+
 /* Free a picture without finishing it. */
 void svac3_picture_free(svac3_picture_t *pic);
+
+/* A picture's memory kept for the next one: a picture is several MB, and
+ * freeing and allocating it for every picture costs page faults. The
+ * _cached calls take a picture from the cache and put it back. */
+typedef struct {
+    svac3_picture_t *pic;
+} svac3_picture_cache_t;
+
+int svac3_picture_begin_cached(const svac3_hls_t *hls, svac3_frame_t *frame,
+                               const svac3_refs_t *refs, svac3_tmv_t *tmv,
+                               svac3_picture_cache_t *cache, svac3_picture_t **pic);
+int svac3_picture_end_cached(svac3_picture_t *pic, const svac3_hls_t *hls,
+                             svac3_picture_cache_t *cache);
+
+/* As svac3_picture_free(), into the cache when it is empty */
+void svac3_picture_release(svac3_picture_t *pic, svac3_picture_cache_t *cache);
+void svac3_picture_cache_free(svac3_picture_cache_t *cache);
 
 #endif /* SVAC3_PATCH_H */

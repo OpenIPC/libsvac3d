@@ -199,6 +199,16 @@ int main(int argc, char **argv)
     CHECK(svac3d_decode(d, buf + start, len - start, out, &c) == SVAC3D_ERR_CORRUPT && c.pics == 0);
     svac3d_close(d);
 
+    /* threads: the same pictures, whole stream or access unit by unit */
+    d = svac3d_open();
+    CHECK(svac3d_set_threads(d, 0) == SVAC3D_ERR_ARG && svac3d_set_threads(NULL, 2) == SVAC3D_ERR_ARG);
+    CHECK(svac3d_set_threads(d, 4) >= 1);
+    sink_t t = { 0xcbf29ce484222325ULL, 0, 0, 0 };
+    CHECK(svac3d_decode(d, buf, len, out, &t) == 0);
+    CHECK(t.pics == ref.pics && t.hash == ref.hash);
+    CHECK(svac3d_set_threads(d, 1) == 1);
+    svac3d_close(d);
+
     CHECK(svac3d_decode(NULL, buf, len, out, NULL) == SVAC3D_ERR_ARG);
     /* a NAL unit too short for its header is an error, not skipped */
     d = svac3d_open();

@@ -23,7 +23,7 @@ extern "C" {
 #endif
 
 #define SVAC3D_VERSION_MAJOR 0
-#define SVAC3D_VERSION_MINOR 1
+#define SVAC3D_VERSION_MINOR 2
 #define SVAC3D_VERSION_PATCH 0
 
 /* Error codes; every call returns 0 or one of these. */
@@ -61,6 +61,11 @@ const char *svac3d_version(void);
 
 svac3d_t *svac3d_open(void);
 void svac3d_close(svac3d_t *d);
+
+/* Decode with this many threads; 1, the default, decodes on the caller's
+ * thread. The output is the same whatever the number. Returns the number
+ * in use (fewer when threads cannot be started), or SVAC3D_ERR_ARG. */
+int svac3d_set_threads(svac3d_t *d, int threads);
 
 /* Forget every decoded picture, as after a seek; parameter sets are kept.
  * Decoding resumes at the next I picture. */

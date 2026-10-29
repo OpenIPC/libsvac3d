@@ -30,6 +30,10 @@ void svac3_dec_destroy(svac3_dec_t *d);
  * complete a picture: *out is set alongside the error then. */
 int svac3_dec_nal(svac3_dec_t *d, const uint8_t *nal, size_t len, const svac3_frame_t **out);
 
+/* Decode with this many threads (1, the default, decodes on the caller's).
+ * Returns the number in use: fewer when threads cannot be started. */
+int svac3_dec_set_threads(svac3_dec_t *d, int threads);
+
 /* Drop every decoded picture (after a seek); parameter sets are kept */
 void svac3_dec_reset(svac3_dec_t *d);
 
