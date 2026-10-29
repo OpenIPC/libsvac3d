@@ -52,12 +52,18 @@ decoded pictures. On the 1080p CBR corpus stream, one core decodes about
 200 pictures a second on a Cortex-X925 and about 110 on a Core i9-13900;
 at high bit rates the entropy decoder, which is serial, sets the pace.
 
+`svac3d_set_threads()` (`svac3dec -t N`, FFmpeg's `-threads`) decodes on
+several threads: one parses while another reconstructs, and the loop
+filters run in bands on all of them. Pictures and their order are the same
+whatever the number; on 2 threads a picture takes about 0.65 of the time.
+
 ## API
 
 `source/svac3/svac3d.h` is the installed interface:
 
 ```c
 svac3d_t *d = svac3d_open();
+svac3d_set_threads(d, 4);                         /* optional */
 svac3d_decode(d, buf, len, on_picture, opaque);   /* Annex-B, any whole NAL units */
 svac3d_close(d);
 ```

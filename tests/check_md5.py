@@ -2,10 +2,11 @@
 # SPDX-License-Identifier: BSD-3-Clause
 # Decode a stream with svac3dec and compare every picture with
 # tests/golden/<stream>.framemd5.
-# usage: check_md5.py <svac3dec> <stream.svac3> <golden.framemd5>
+# usage: check_md5.py <svac3dec> <stream.svac3> <golden.framemd5> [threads]
 import hashlib, os, subprocess, sys, tempfile
 
 dec, stream, golden = sys.argv[1:4]
+threads = sys.argv[4:5]
 here = os.path.dirname(os.path.abspath(__file__))
 ref = {}
 for line in open(golden):
@@ -23,7 +24,8 @@ h = next(int(l.split('=')[1]) for l in dump if l.startswith('vertical_size='))
 
 with tempfile.TemporaryDirectory() as tmp:
     out = os.path.join(tmp, 'out.yuv')
-    subprocess.run([dec, stream, out], check=True, capture_output=True)
+    subprocess.run([dec] + (['-t'] + threads if threads else []) + [stream, out],
+                   check=True, capture_output=True)
     data = open(out, 'rb').read()
 
 fs = w * h * 3 // 2

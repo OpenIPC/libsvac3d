@@ -3,7 +3,7 @@
  *
  * svac3dec: decode an SVAC3 elementary stream to raw I420 (one frame per
  * picture, cropped to the display size).
- * usage: svac3dec stream.svac3 out.yuv
+ * usage: svac3dec [-t threads] stream.svac3 out.yuv
  */
 #include <stdio.h>
 #include <stdlib.h>
@@ -14,8 +14,14 @@
 
 int main(int argc, char **argv)
 {
-    if (argc != 3) {
-        fprintf(stderr, "usage: %s stream.svac3 out.yuv\n", argv[0]);
+    int threads = 1;
+    if (argc == 5 && !strcmp(argv[1], "-t")) {
+        threads = atoi(argv[2]);
+        argv += 2;
+        argc -= 2;
+    }
+    if (argc != 3 || threads < 1) {
+        fprintf(stderr, "usage: %s [-t threads] stream.svac3 out.yuv\n", argv[0]);
         return 2;
     }
     size_t len;
@@ -33,6 +39,8 @@ int main(int argc, char **argv)
 
     if (!dec)
         goto out;
+    if (threads > 1)
+        svac3_dec_set_threads(dec, threads);
 
     size_t pos = 0, nal_len;
     const uint8_t *nal;

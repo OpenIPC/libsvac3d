@@ -68,7 +68,7 @@ static void edge_params(const svac3_dbk_info_t *d, int xp, int yp, int xq, int y
  * filtered at once, with the parameters of each 4x4 luma unit pair (4 luma
  * or 2 chroma lines). */
 static void plane_edges(svac3_frame_t *f, const svac3_dbk_info_t *d, int c, int ver,
-                        const svac3_dsp_t *dsp)
+                        const svac3_dsp_t *dsp, int b0, int b1)
 {
     uint8_t *P = f->plane[c];
     const ptrdiff_t s = f->stride[c];
@@ -77,9 +77,15 @@ static void plane_edges(svac3_frame_t *f, const svac3_dbk_info_t *d, int c, int 
     const int delta = c == 1 ? d->cb_delta : c == 2 ? d->cr_delta : 0;
     int alpha[4], beta[4];
 
-    for (int e = 8; e < (ver ? W : H); e += 8)           /* the edge's position */
-        for (int a = 0; a < (ver ? H : W); a += 8) {     /* along it */
-            const int n = (ver ? H : W) - a < 8 ? (ver ? H : W) - a : 8;
+    /* rows b0..b1 of the plane: the lines of vertical edges, or the
+     * positions of horizontal ones */
+    if (b1 > H)
+        b1 = H;
+    const int e0 = ver ? 8 : (b0 > 8 ? b0 : 8), e1 = ver ? W : b1;
+    const int a0 = ver ? b0 : 0, a1 = ver ? b1 : W;
+    for (int e = e0; e < e1; e += 8)                     /* the edge's position */
+        for (int a = a0; a < a1; a += 8) {               /* along it */
+            const int n = a1 - a < 8 ? a1 - a : 8;
             int any = 0;
             for (int g = 0; g * group < n; g++) {
                 const int along = (a + g * group) * sc, across = e * sc;
@@ -97,21 +103,112 @@ static void plane_edges(svac3_frame_t *f, const svac3_dbk_info_t *d, int c, int 
         }
 }
 
-void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d)
+/* Bands of 64 luma (32 chroma) rows: within one direction, the edges of
+ * different bands touch different samples, so bands run in parallel */
+#define BAND 64
+
+typedef struct {
+    svac3_frame_t *f;
+    const svac3_dbk_info_t *d;
+    const svac3_dsp_t *dsp;
+    int ver, bands[3];
+} dbk_job_t;
+
+static void dbk_band(void *arg, int i)
 {
-    const svac3_dsp_t *dsp = svac3_dsp();
-    plane_edges(f, d, 0, 1, dsp);
-    plane_edges(f, d, 0, 0, dsp);
-    for (int c = 1; c <= 2; c++)
-        plane_edges(f, d, c, 1, dsp);
-    for (int c = 1; c <= 2; c++)
-        plane_edges(f, d, c, 0, dsp);
+    const dbk_job_t *j = arg;
+    int c = 0;
+    while (i >= j->bands[c]) {
+        i -= j->bands[c];
+        c++;
+    }
+    const int h = c ? BAND / 2 : BAND;
+    plane_edges(j->f, j->d, c, j->ver, j->dsp, i * h, (i + 1) * h);
+}
+
+void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d, svac3_pool_t *pool)
+{
+    dbk_job_t j = { .f = f, .d = d, .dsp = svac3_dsp() };
+    for (int c = 0; c < 3; c++) {
+        const int h = c ? BAND / 2 : BAND;
+        j.bands[c] = (f->height[c] + h - 1) / h;
+    }
+    const int n = j.bands[0] + j.bands[1] + j.bands[2];
+    /* all the vertical edges of the picture, then all the horizontal ones */
+    j.ver = 1;
+    svac3_pool_run(pool, dbk_band, &j, n);
+    j.ver = 0;
+    svac3_pool_run(pool, dbk_band, &j, n);
 }
 
 /* ------------------------------------------------------------------------ */
 /* SAO, 5.4.12.1 */
 
-int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size, int lcu_w, int lcu_h)
+typedef struct {
+    uint8_t *dst;
+    const uint8_t *src;
+    const svac3_sao_t (*sao)[3];
+    const svac3_dsp_t *dsp;
+    int c, W, H, s, L, lcu_w, lcu_h;
+} sao_job_t;
+
+/* One row of LCUs of one component: SAO reads the deblocked copy, so rows
+ * run in parallel */
+static void sao_row(void *arg, int ly)
+{
+    const sao_job_t *j = arg;
+    uint8_t *dst = j->dst;
+    const uint8_t *src = j->src;
+    const svac3_sao_t (*sao)[3] = j->sao;
+    const svac3_dsp_t *dsp = j->dsp;
+    const int c = j->c, W = j->W, H = j->H, s = j->s, L = j->L, lcu_w = j->lcu_w, lcu_h = j->lcu_h;
+    for (int lx = 0; lx < lcu_w; lx++) {
+        const svac3_sao_t *p = &sao[ly * lcu_w + lx][c];
+        if (p->mode == 0)
+            continue;
+        /* 5.4.12.1.2: the LCU moved up and left by 4, clipped to the
+         * picture, and extended to the right/bottom picture edge */
+        int x0 = lx * L - 4, y0 = ly * L - 4, x1 = (lx + 1) * L - 4, y1 = (ly + 1) * L - 4;
+        if (x0 < 0)
+            x0 = 0;
+        if (y0 < 0)
+            y0 = 0;
+        if (lx == lcu_w - 1 || x1 > W)
+            x1 = W;
+        if (ly == lcu_h - 1 || y1 > H)
+            y1 = H;
+
+        const ptrdiff_t off = (ptrdiff_t)y0 * s + x0;
+        if (p->mode == 1) {
+            int8_t band[32] = { 0 };
+            band[p->start_pos] = p->offset[0];
+            band[(p->start_pos + 1) % 32] = p->offset[1];
+            band[(p->start_pos + p->delta_pos_minus2 + 2) % 32] = p->offset[2];
+            band[(p->start_pos + p->delta_pos_minus2 + 3) % 32] = p->offset[3];
+            dsp->sao_band(dst + off, src + off, s, x1 - x0, y1 - y0, band);
+        } else {
+            /* neighbours a and b of each sample; a sample with one
+             * outside the picture is left as it is, so the region
+             * shrinks to those with both inside */
+            static const int dx[4][2] = { { -1, 1 }, { 0, 0 }, { -1, 1 }, { 1, -1 } };
+            static const int dy[4][2] = { { 0, 0 }, { -1, 1 }, { -1, 1 }, { -1, 1 } };
+            const int t = p->edge_type;
+            const int ex = dx[t][0] != 0, ey = dy[t][0] != 0;
+            const int xs = x0 > ex ? x0 : ex, xe = x1 < W - ex ? x1 : W - ex;
+            const int ys = y0 > ey ? y0 : ey, ye = y1 < H - ey ? y1 : H - ey;
+            if (xs >= xe || ys >= ye)
+                continue;
+            const int8_t o[5] = { (int8_t)p->offset[0], (int8_t)p->offset[1], 0,
+                                  (int8_t)p->offset[2], (int8_t)p->offset[3] };
+            const ptrdiff_t at = (ptrdiff_t)ys * s + xs;
+            dsp->sao_edge(dst + at, src + at, s, xe - xs, ye - ys,
+                          dy[t][0] * (ptrdiff_t)s + dx[t][0], dy[t][1] * (ptrdiff_t)s + dx[t][1], o);
+        }
+    }
+}
+
+int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size, int lcu_w, int lcu_h,
+              svac3_pool_t *pool)
 {
     const svac3_dsp_t *dsp = svac3_dsp();
     for (int c = 0; c < 3; c++) {
@@ -121,52 +218,9 @@ int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size, int l
         if (!src)
             return -1;
         memcpy(src, f->plane[c], (size_t)s * H);
-        uint8_t *dst = f->plane[c];
-
-        for (int ly = 0; ly < lcu_h; ly++)
-            for (int lx = 0; lx < lcu_w; lx++) {
-                const svac3_sao_t *p = &sao[ly * lcu_w + lx][c];
-                if (p->mode == 0)
-                    continue;
-                /* 5.4.12.1.2: the LCU moved up and left by 4, clipped to the
-                 * picture, and extended to the right/bottom picture edge */
-                int x0 = lx * L - 4, y0 = ly * L - 4, x1 = (lx + 1) * L - 4, y1 = (ly + 1) * L - 4;
-                if (x0 < 0)
-                    x0 = 0;
-                if (y0 < 0)
-                    y0 = 0;
-                if (lx == lcu_w - 1 || x1 > W)
-                    x1 = W;
-                if (ly == lcu_h - 1 || y1 > H)
-                    y1 = H;
-
-                const ptrdiff_t off = (ptrdiff_t)y0 * s + x0;
-                if (p->mode == 1) {
-                    int8_t band[32] = { 0 };
-                    band[p->start_pos] = p->offset[0];
-                    band[(p->start_pos + 1) % 32] = p->offset[1];
-                    band[(p->start_pos + p->delta_pos_minus2 + 2) % 32] = p->offset[2];
-                    band[(p->start_pos + p->delta_pos_minus2 + 3) % 32] = p->offset[3];
-                    dsp->sao_band(dst + off, src + off, s, x1 - x0, y1 - y0, band);
-                } else {
-                    /* neighbours a and b of each sample; a sample with one
-                     * outside the picture is left as it is, so the region
-                     * shrinks to those with both inside */
-                    static const int dx[4][2] = { { -1, 1 }, { 0, 0 }, { -1, 1 }, { 1, -1 } };
-                    static const int dy[4][2] = { { 0, 0 }, { -1, 1 }, { -1, 1 }, { -1, 1 } };
-                    const int t = p->edge_type;
-                    const int ex = dx[t][0] != 0, ey = dy[t][0] != 0;
-                    const int xs = x0 > ex ? x0 : ex, xe = x1 < W - ex ? x1 : W - ex;
-                    const int ys = y0 > ey ? y0 : ey, ye = y1 < H - ey ? y1 : H - ey;
-                    if (xs >= xe || ys >= ye)
-                        continue;
-                    const int8_t o[5] = { (int8_t)p->offset[0], (int8_t)p->offset[1], 0,
-                                          (int8_t)p->offset[2], (int8_t)p->offset[3] };
-                    const ptrdiff_t at = (ptrdiff_t)ys * s + xs;
-                    dsp->sao_edge(dst + at, src + at, s, xe - xs, ye - ys,
-                                  dy[t][0] * (ptrdiff_t)s + dx[t][0], dy[t][1] * (ptrdiff_t)s + dx[t][1], o);
-                }
-            }
+        sao_job_t j = { .dst = f->plane[c], .src = src, .sao = sao, .dsp = dsp, .c = c,
+                        .W = W, .H = H, .s = s, .L = L, .lcu_w = lcu_w, .lcu_h = lcu_h };
+        svac3_pool_run(pool, sao_row, &j, lcu_h);
         free(src);
     }
     return 0;

@@ -45,6 +45,13 @@ void svac3d_close(svac3d_t *d)
     free(d);
 }
 
+int svac3d_set_threads(svac3d_t *d, int threads)
+{
+    if (!d || threads < 1)
+        return SVAC3D_ERR_ARG;
+    return svac3_dec_set_threads(d->dec, threads);
+}
+
 void svac3d_reset(svac3d_t *d)
 {
     if (d)

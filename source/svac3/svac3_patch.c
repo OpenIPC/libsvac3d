@@ -10,6 +10,7 @@
 #include "svac3_recon.h"
 #include "svac3_loopfilter.h"
 
+#include <pthread.h>
 #include <stdlib.h>
 #include <string.h>
 
@@ -92,6 +93,8 @@ typedef struct {
     int cur_patch, plx0, plx1, ply0, ply1;
     int num_patches, next_patch;   /* patches the picture has, and the one due */
     svac3_tmv_t *tmv_out;
+    svac3_pool_t *pool;          /* threads for the loop filters, or NULL */
+    struct svac3_picture *pic;   /* parsing: where coding-unit records go */
 
     /* scratch for one transform block */
     int16_t order[64 * 64];
@@ -727,6 +730,43 @@ static void recon_chroma_inter(parser_t *p, int x0, int y0, int w, int h, int qp
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* Parsing and reconstruction meet through coding-unit records: the parser
+ * (one parser_t) emits one per coding unit, the reconstruction (another,
+ * with its own map of decoded units, since availability for prediction
+ * means reconstructed) consumes them in order, on the same thread or on
+ * one of its own. */
+
+enum { REC_CU, REC_CHROMA, REC_PATCH };
+
+typedef struct {
+    uint8_t kind;
+    uint8_t comp, skip, direct, intra, subtype, ref, lidx, eipm, cidx, ctp;
+    uint8_t group_start;         /* the CU opens a QP group */
+    uint8_t lcu_qp;
+    uint8_t patch, patch_qp, fixed_qp;   /* REC_PATCH */
+    int16_t dqp;
+    int32_t mvd[2];              /* as parsed: derive_mvp() clips the sum */
+    uint16_t x0, y0, w, h;
+    const int16_t *coef[3];      /* by component, when its ctp bit is set */
+} cu_rec_t;
+
+static void emit(parser_t *p, cu_rec_t *rec);
+
+static void cu_recon_chroma(parser_t *r, const cu_rec_t *rec)
+{
+    const int x0 = rec->x0, y0 = rec->y0, w = rec->w, h = rec->h;
+    const scu_t *luma = scu_at(r, x0 + w - 1, y0 + h - 1);
+    for (int i = 1; i < 3; i++)
+        if (rec->ctp & (1 << i))
+            memcpy(r->coef[i], rec->coef[i], sizeof(int16_t) * (size_t)(w / 2) * (h / 2));
+    if (luma && luma->intra)
+        recon_chroma(r, x0, y0, w, h, derive_chroma_mode(rec->cidx, luma->ipm), luma->ipm,
+                     luma->qp, rec->ctp);
+    else if (luma)
+        recon_chroma_inter(r, x0, y0, w, h, luma->qp, rec->ctp);
+}
+
 static void coding_unit_chroma(parser_t *p, int x0, int y0, int w, int h)
 {
     const scu_t *luma = scu_at(p, x0 + w - 1, y0 + h - 1);
@@ -743,11 +783,82 @@ static void coding_unit_chroma(parser_t *p, int x0, int y0, int w, int h)
             parse_srcc_block(p, w / 2, h / 2, 1, prior_intra, p->coef[i]);
     p->st->chroma_cus++;
 
-    if (p->recon && luma && prior_intra)
-        recon_chroma(p, x0, y0, w, h, derive_chroma_mode(cidx, luma->ipm), luma->ipm,
-                     luma->qp, ctp);
-    else if (p->recon && luma)
-        recon_chroma_inter(p, x0, y0, w, h, luma->qp, ctp);
+    cu_rec_t rec = { .kind = REC_CHROMA, .cidx = (uint8_t)cidx, .ctp = (uint8_t)ctp,
+                     .x0 = (uint16_t)x0, .y0 = (uint16_t)y0, .w = (uint16_t)w, .h = (uint16_t)h,
+                     .coef = { NULL, p->coef[1], p->coef[2] } };
+    emit(p, &rec);
+}
+
+static void cu_recon(parser_t *r, const cu_rec_t *rec)
+{
+    const int x0 = rec->x0, y0 = rec->y0, w = rec->w, h = rec->h;
+    const int intra = rec->intra, skip = rec->skip, direct = rec->direct, ctp = rec->ctp;
+    int ref = rec->ref;
+
+    r->lcu_qp = rec->lcu_qp;
+    r->qp_group_x = rec->group_start ? x0 : -1;
+    r->qp_group_y = rec->group_start ? y0 : -1;
+    for (int c = 0; c < 3; c++)
+        if (ctp & (1 << c))
+            memcpy(r->coef[c], rec->coef[c],
+                   sizeof(int16_t) * (size_t)(c ? (w / 2) * (h / 2) : w * h));
+
+    const int qp = derive_qp(r, x0, y0, ctp, rec->dqp);
+    const int lmode = intra ? derive_luma_mode(r, x0, y0, rec->lidx, rec->eipm) : 0;
+
+    int mv[2] = { 0, 0 };
+    if (intra) {
+        svac3_intra_pred(r->frame, 0, x0, y0, w, h, lmode, 0, r->mipf, avail_cb, r, r->pred);
+        const int16_t *res = NULL;
+        if (ctp & 1) {
+            svac3_dequant_itrans(r->coef[0], w, h, qp, r->resid);
+            res = r->resid;
+        }
+        svac3_put_block(r->frame, 0, x0, y0, w, h, r->pred, res);
+    } else {
+        const int mvd[2] = { rec->mvd[0], rec->mvd[1] };
+        if (skip || direct)
+            derive_skip_motion(r, x0, y0, w, h, rec->subtype, &ref, mv);
+        else
+            derive_mvp(r, x0, y0, w, ref, mvd, mv);
+        recon_inter(r, x0, y0, w, h, ref, mv, qp, ctp, rec->comp == COMP_LUMACHROMA);
+    }
+
+    scu_mark(r, x0, y0, w, h, skip, intra);
+    /* the mark above makes this CU's own samples "available"; record its mode,
+     * QP and motion for later neighbours and for a deferred chroma CU */
+    for (int yy = y0; yy < y0 + h && yy < r->pic_h; yy += 4)
+        for (int xx = x0; xx < x0 + w && xx < r->pic_w; xx += 4) {
+            scu_t *s = &r->scu[(yy >> 2) * r->scu_stride + (xx >> 2)];
+            s->ipm = (uint8_t)lmode;
+            s->qp = (uint8_t)qp;
+            s->cbf = ctp != 0;
+            s->ref = (int8_t)(intra ? -1 : ref);
+            s->mv[0] = (int16_t)mv[0];
+            s->mv[1] = (int16_t)mv[1];
+        }
+
+    if (intra && rec->comp == COMP_LUMACHROMA)
+        recon_chroma(r, x0, y0, w, h, derive_chroma_mode(rec->cidx, lmode), lmode, qp, ctp);
+}
+
+/* One record, on the reconstruction's parser_t */
+static void recon_rec(parser_t *r, const cu_rec_t *rec)
+{
+    switch (rec->kind) {
+    case REC_PATCH:
+        r->cur_patch = rec->patch;
+        r->patch_qp = rec->patch_qp;
+        r->prev_cu_qp = r->lcu_qp = rec->patch_qp;
+        r->fixed_qp = rec->fixed_qp;
+        break;
+    case REC_CU:
+        cu_recon(r, rec);
+        break;
+    case REC_CHROMA:
+        cu_recon_chroma(r, rec);
+        break;
+    }
 }
 
 static void coding_unit(parser_t *p, int x0, int y0, int w, int h, int mode, int comp)
@@ -865,42 +976,19 @@ static void coding_unit(parser_t *p, int x0, int y0, int w, int h, int mode, int
     if (ctp & 4)
         parse_srcc_block(p, w / 2, h / 2, 1, intra, p->coef[2]);
 
-    const int qp = derive_qp(p, x0, y0, ctp, dqp);
-    const int lmode = intra ? derive_luma_mode(p, x0, y0, lidx, eipm) : 0;
+    cu_rec_t rec = {
+        .kind = REC_CU, .comp = (uint8_t)comp, .skip = (uint8_t)skip, .direct = (uint8_t)direct,
+        .intra = (uint8_t)intra, .subtype = (uint8_t)subtype, .ref = (uint8_t)ref,
+        .lidx = (uint8_t)lidx, .eipm = (uint8_t)eipm, .cidx = (uint8_t)cidx, .ctp = (uint8_t)ctp,
+        .group_start = x0 == p->qp_group_x && y0 == p->qp_group_y, .lcu_qp = (uint8_t)p->lcu_qp,
+        .dqp = (int16_t)dqp, .mvd = { mvd[0], mvd[1] },
+        .x0 = (uint16_t)x0, .y0 = (uint16_t)y0, .w = (uint16_t)w, .h = (uint16_t)h,
+        .coef = { p->coef[0], p->coef[1], p->coef[2] },
+    };
+    emit(p, &rec);
 
-    int mv[2] = { 0, 0 };
-    if (p->recon && intra) {
-        svac3_intra_pred(p->frame, 0, x0, y0, w, h, lmode, 0, p->mipf, avail_cb, p, p->pred);
-        const int16_t *res = NULL;
-        if (ctp & 1) {
-            svac3_dequant_itrans(p->coef[0], w, h, qp, p->resid);
-            res = p->resid;
-        }
-        svac3_put_block(p->frame, 0, x0, y0, w, h, p->pred, res);
-    } else if (p->recon) {
-        if (skip || direct)
-            derive_skip_motion(p, x0, y0, w, h, subtype, &ref, mv);
-        else
-            derive_mvp(p, x0, y0, w, ref, mvd, mv);
-        recon_inter(p, x0, y0, w, h, ref, mv, qp, ctp, comp == COMP_LUMACHROMA);
-    }
-
+    /* the parser's own map: what later syntax depends on */
     scu_mark(p, x0, y0, w, h, skip, intra);
-    /* the mark above makes this CU's own samples "available"; record its mode,
-     * QP and motion for later neighbours and for a deferred chroma CU */
-    for (int yy = y0; yy < y0 + h && yy < p->pic_h; yy += 4)
-        for (int xx = x0; xx < x0 + w && xx < p->pic_w; xx += 4) {
-            scu_t *s = &p->scu[(yy >> 2) * p->scu_stride + (xx >> 2)];
-            s->ipm = (uint8_t)lmode;
-            s->qp = (uint8_t)qp;
-            s->cbf = ctp != 0;
-            s->ref = (int8_t)(intra ? -1 : ref);
-            s->mv[0] = (int16_t)mv[0];
-            s->mv[1] = (int16_t)mv[1];
-        }
-
-    if (p->recon && intra && comp == COMP_LUMACHROMA)
-        recon_chroma(p, x0, y0, w, h, derive_chroma_mode(cidx, lmode), lmode, qp, ctp);
 
     p->st->cus++;
     p->st->intra_cus += intra;
@@ -1102,7 +1190,7 @@ static int loop_filters(parser_t *p, const svac3_hls_t *hls)
             .filter_type = hls->pps.deblocking_filter_type,
             .cb_delta = p->cb_delta, .cr_delta = p->cr_delta,
         };
-        svac3_deblock(p->frame, &d);
+        svac3_deblock(p->frame, &d, p->pool);
     }
     free(id);
     free(qp);
@@ -1110,7 +1198,8 @@ static int loop_filters(parser_t *p, const svac3_hls_t *hls)
     free(ref);
     free(mv);
     if (p->sps->sao_enable_flag)
-        return svac3_sao(p->frame, (const svac3_sao_t (*)[3])p->sao, p->lcu_size, p->lcu_w, p->lcu_h)
+        return svac3_sao(p->frame, (const svac3_sao_t (*)[3])p->sao, p->lcu_size, p->lcu_w, p->lcu_h,
+                         p->pool)
                ? SVAC3_ERR_NOMEM : SVAC3_OK;
     return SVAC3_OK;
 }
@@ -1237,9 +1326,156 @@ static int refs_ok(const svac3_refs_t *r, int need, const svac3_frame_t *frame, 
     return !tmvp || r->col;
 }
 
+/* Records, and the coefficients they point at, in chunks that never move */
+#define REC_CHUNK  2048
+#define COEF_CHUNK (1 << 18)
+
+typedef struct rec_chunk {
+    struct rec_chunk *next;
+    cu_rec_t rec[REC_CHUNK];
+} rec_chunk_t;
+
+typedef struct coef_chunk {
+    struct coef_chunk *next;
+    size_t used;
+    int16_t data[COEF_CHUNK];
+} coef_chunk_t;
+
 struct svac3_picture {
-    parser_t p;
+    parser_t p;                  /* parsing */
+    parser_t r;                  /* reconstruction */
+
+    /* with a pool: records go to a reconstruction thread */
+    int threaded, failed;        /* failed: out of memory for records */
+    pthread_t worker;
+    pthread_mutex_t lock;
+    pthread_cond_t ready;
+    rec_chunk_t *rec_head, *rec_tail;
+    int tail_n;                  /* records in rec_tail */
+    long produced, published;
+    int ending;                  /* every record is published: the worker stops */
+    coef_chunk_t *coef_head, *coef_tail;
+
+    /* kept for the next picture of a cache: spare chunks, buffer sizes */
+    rec_chunk_t *rec_spare;
+    coef_chunk_t *coef_spare;
+    size_t scu_n, sao_n;
 };
+
+/* A copy of n coefficients in the picture's chunks, or NULL */
+static const int16_t *keep_coefs(svac3_picture_t *pic, const int16_t *c, size_t n)
+{
+    coef_chunk_t *t = pic->coef_tail;
+    if (!t || t->used + n > COEF_CHUNK) {
+        if ((t = pic->coef_spare))
+            pic->coef_spare = t->next;
+        else if (!(t = malloc(sizeof(*t))))
+            return NULL;
+        t->next = NULL;
+        t->used = 0;
+        if (pic->coef_tail)
+            pic->coef_tail->next = t;
+        else
+            pic->coef_head = t;
+        pic->coef_tail = t;
+    }
+    int16_t *d = t->data + t->used;
+    memcpy(d, c, n * sizeof(*c));
+    t->used += n;
+    return d;
+}
+
+static void publish(svac3_picture_t *pic)
+{
+    pthread_mutex_lock(&pic->lock);
+    pic->published = pic->produced;
+    pthread_cond_signal(&pic->ready);
+    pthread_mutex_unlock(&pic->lock);
+}
+
+static void emit(parser_t *p, cu_rec_t *rec)
+{
+    svac3_picture_t *pic = p->pic;
+    if (!p->recon || !pic)
+        return;
+    if (!pic->threaded) {
+        recon_rec(&pic->r, rec);                 /* in step with the parser */
+        return;
+    }
+    if (pic->failed)
+        return;
+    /* the parser reuses its coefficient buffers: keep a copy */
+    for (int c = 0; c < 3; c++)
+        if ((rec->kind == REC_CU || rec->kind == REC_CHROMA) && (rec->ctp & (1 << c))) {
+            const size_t n = c ? (size_t)(rec->w / 2) * (rec->h / 2) : (size_t)rec->w * rec->h;
+            if (!(rec->coef[c] = keep_coefs(pic, rec->coef[c], n))) {
+                pic->failed = 1;
+                return;
+            }
+        }
+    if (!pic->rec_tail || pic->tail_n == REC_CHUNK) {
+        rec_chunk_t *ch = pic->rec_spare;
+        if (ch)
+            pic->rec_spare = ch->next;
+        else if (!(ch = malloc(sizeof(*ch)))) {
+            pic->failed = 1;
+            return;
+        }
+        ch->next = NULL;
+        if (pic->rec_tail)
+            pic->rec_tail->next = ch;
+        else
+            pic->rec_head = ch;
+        pic->rec_tail = ch;
+        pic->tail_n = 0;
+    }
+    pic->rec_tail->rec[pic->tail_n++] = *rec;
+    pic->produced++;
+}
+
+/* The reconstruction thread: records in order, until they end */
+static void *recon_worker(void *arg)
+{
+    svac3_picture_t *pic = arg;
+    rec_chunk_t *ch = NULL;
+    int idx = 0;
+    long done = 0;
+    for (;;) {
+        pthread_mutex_lock(&pic->lock);
+        while (pic->published == done && !pic->ending)
+            pthread_cond_wait(&pic->ready, &pic->lock);
+        const long avail = pic->published;
+        const int last = pic->ending;
+        if (!ch)
+            ch = pic->rec_head;
+        pthread_mutex_unlock(&pic->lock);
+        for (; done < avail; done++) {
+            if (idx == REC_CHUNK) {
+                ch = ch->next;
+                idx = 0;
+            }
+            recon_rec(&pic->r, &ch->rec[idx++]);
+        }
+        if (last && done == avail)
+            return NULL;
+    }
+}
+
+/* Stop the reconstruction thread once it has done every record */
+static void finish_worker(svac3_picture_t *pic)
+{
+    if (!pic->threaded)
+        return;
+    pthread_mutex_lock(&pic->lock);
+    pic->published = pic->produced;
+    pic->ending = 1;
+    pthread_cond_signal(&pic->ready);
+    pthread_mutex_unlock(&pic->lock);
+    pthread_join(pic->worker, NULL);
+    pthread_mutex_destroy(&pic->lock);
+    pthread_cond_destroy(&pic->ready);
+    pic->threaded = 0;
+}
 
 int svac3_picture_patches(const svac3_hls_t *hls)
 {
@@ -1252,24 +1488,121 @@ int svac3_picture_patches(const svac3_hls_t *hls)
     return n > 256 ? -1 : (int)n;           /* patch_index is 8 bits */
 }
 
+/* The picture's chunks go back to its spares */
+static void spare_chunks(svac3_picture_t *pic)
+{
+    while (pic->rec_head) {
+        rec_chunk_t *n = pic->rec_head->next;
+        pic->rec_head->next = pic->rec_spare;
+        pic->rec_spare = pic->rec_head;
+        pic->rec_head = n;
+    }
+    while (pic->coef_head) {
+        coef_chunk_t *n = pic->coef_head->next;
+        pic->coef_head->next = pic->coef_spare;
+        pic->coef_spare = pic->coef_head;
+        pic->coef_head = n;
+    }
+    pic->rec_tail = NULL;
+    pic->coef_tail = NULL;
+}
+
 void svac3_picture_free(svac3_picture_t *pic)
 {
     if (!pic)
         return;
+    finish_worker(pic);
+    spare_chunks(pic);
+    while (pic->rec_spare) {
+        rec_chunk_t *n = pic->rec_spare->next;
+        free(pic->rec_spare);
+        pic->rec_spare = n;
+    }
+    while (pic->coef_spare) {
+        coef_chunk_t *n = pic->coef_spare->next;
+        free(pic->coef_spare);
+        pic->coef_spare = n;
+    }
     free(pic->p.sao);
     free(pic->p.scu);
+    free(pic->r.scu);
     free(pic);
+}
+
+void svac3_picture_release(svac3_picture_t *pic, svac3_picture_cache_t *cache)
+{
+    if (!pic)
+        return;
+    if (!cache || cache->pic) {
+        svac3_picture_free(pic);
+        return;
+    }
+    finish_worker(pic);
+    spare_chunks(pic);
+    cache->pic = pic;
+}
+
+void svac3_picture_cache_free(svac3_picture_cache_t *cache)
+{
+    if (cache) {
+        svac3_picture_free(cache->pic);
+        cache->pic = NULL;
+    }
 }
 
 int svac3_picture_begin(const svac3_hls_t *hls, svac3_frame_t *frame, const svac3_refs_t *refs,
                         svac3_tmv_t *tmv, svac3_picture_t **out)
+{
+    return svac3_picture_begin_cached(hls, frame, refs, tmv, NULL, out);
+}
+
+/* A picture from the cache, its buffers kept and everything else cleared,
+ * or a new one */
+static svac3_picture_t *take_picture(svac3_picture_cache_t *cache)
+{
+    svac3_picture_t *pic = cache ? cache->pic : NULL;
+    if (!pic)
+        return calloc(1, sizeof(*pic));
+    cache->pic = NULL;
+    scu_t *ps = pic->p.scu, *rs = pic->r.scu;
+    svac3_sao_t (*sao)[3] = pic->p.sao;
+    rec_chunk_t *rsp = pic->rec_spare;
+    coef_chunk_t *csp = pic->coef_spare;
+    const size_t scu_n = pic->scu_n, sao_n = pic->sao_n;
+    memset(pic, 0, sizeof(*pic));
+    pic->p.scu = ps;
+    pic->r.scu = rs;
+    pic->p.sao = sao;
+    pic->rec_spare = rsp;
+    pic->coef_spare = csp;
+    pic->scu_n = scu_n;
+    pic->sao_n = sao_n;
+    return pic;
+}
+
+/* buf, holding *have elements of size sz, cleared and n long */
+static void *zeroed(void *buf, size_t *have, size_t n, size_t sz)
+{
+    if (buf && *have == n) {
+        memset(buf, 0, n * sz);
+        return buf;
+    }
+    free(buf);
+    buf = calloc(n, sz);
+    *have = buf ? n : 0;
+    return buf;
+}
+
+int svac3_picture_begin_cached(const svac3_hls_t *hls, svac3_frame_t *frame,
+                               const svac3_refs_t *refs, svac3_tmv_t *tmv,
+                               svac3_picture_cache_t *cache, svac3_picture_t **out)
 {
     int ret = svac3_patch_supported(hls);
 
     *out = NULL;
     if (ret)
         return ret;
-    svac3_picture_t *pic = calloc(1, sizeof(*pic));
+    svac3_picture_t *pic = take_picture(cache);
     if (!pic)
         return SVAC3_ERR_NOMEM;
     parser_t *p = &pic->p;
@@ -1306,7 +1639,7 @@ int svac3_picture_begin(const svac3_hls_t *hls, svac3_frame_t *frame, const svac
     if (!ret && frame && p->pct == 2 && !refs_ok(refs, p->num_ref_active0, frame, p->tmvp))
         ret = SVAC3_ERR_INVALID;
     if (ret) {
-        free(pic);
+        svac3_picture_free(pic);       /* with what the cache had kept */
         return ret;
     }
     p->frame = frame;
@@ -1317,12 +1650,26 @@ int svac3_picture_begin(const svac3_hls_t *hls, svac3_frame_t *frame, const svac
     p->cb_delta = hls->ph.chroma_quant_param_disable_flag ? 0 : hls->ph.chroma_quant_param_delta_cb;
     p->cr_delta = hls->ph.chroma_quant_param_disable_flag ? 0 : hls->ph.chroma_quant_param_delta_cr;
     p->scu_stride = (p->pic_w + 3) / 4;
-    p->scu = calloc((size_t)p->scu_stride * ((p->pic_h + 3) / 4), sizeof(scu_t));
-    if (p->scu && p->recon)
-        p->sao = calloc((size_t)p->lcu_w * p->lcu_h, sizeof(*p->sao));
-    if (!p->scu || (p->recon && !p->sao)) {
+    const size_t scu_n = (size_t)p->scu_stride * ((p->pic_h + 3) / 4);
+    size_t have = pic->scu_n, rhave = pic->scu_n;
+    p->scu = zeroed(p->scu, &have, scu_n, sizeof(scu_t));
+    if (p->recon) {
+        p->sao = zeroed(p->sao, &pic->sao_n, (size_t)p->lcu_w * p->lcu_h, sizeof(*p->sao));
+        pic->r.scu = zeroed(pic->r.scu, &rhave, scu_n, sizeof(scu_t));
+    }
+    pic->scu_n = have;
+    if (!p->scu || (p->recon && (!p->sao || !pic->r.scu || rhave != scu_n))) {
         svac3_picture_free(pic);
         return SVAC3_ERR_NOMEM;
+    }
+    p->pic = pic;
+    if (p->recon) {
+        /* the reconstruction: the same picture, its own map of decoded units */
+        parser_t *r = &pic->r;
+        scu_t *rs = r->scu;                     /* cleared above */
+        memcpy(r, p, sizeof(*r));
+        r->pic = NULL;
+        r->scu = rs;
     }
     *out = pic;
     return SVAC3_OK;
@@ -1359,6 +1706,9 @@ static int decode_patch(parser_t *p, const svac3_hls_t *hls, const uint8_t *data
     p->num_delta_qp = 0;
     p->qp_group_x = p->plx0 * p->lcu_size;
     p->qp_group_y = p->ply0 * p->lcu_size;
+    cu_rec_t start = { .kind = REC_PATCH, .patch = (uint8_t)k, .patch_qp = (uint8_t)p->patch_qp,
+                       .fixed_qp = (uint8_t)p->fixed_qp };
+    emit(p, &start);
     svac3_ctx_init(p->ctx, SVAC3_NUM_CTX);
     svac3_aec_init(&p->aec, data + hls->patch.aec_data_offset,
                    len - hls->patch.aec_data_offset, s->maec_enable_flag, p->pct);
@@ -1393,6 +1743,8 @@ static int decode_patch(parser_t *p, const svac3_hls_t *hls, const uint8_t *data
                          1, PRED_NO_CONSTRAINT);
         const int stuff = svac3_aec_stuffing_bit(&p->aec);
         st->lcus++;
+        if (p->pic && p->pic->threaded)
+            publish(p->pic);                    /* an LCU's records at a time */
         if (stuff != (i == n_lcu - 1)) {
             if (st->stuffing_ok)
                 st->first_bad_lcu = (unsigned)l;
@@ -1409,6 +1761,26 @@ static int decode_patch(parser_t *p, const svac3_hls_t *hls, const uint8_t *data
     st->bytes_used = svac3_aec_bytes_read(&p->aec);
     st->overrun_bits = svac3_aec_overrun(&p->aec);
     return SVAC3_OK;
+}
+
+void svac3_picture_set_pool(svac3_picture_t *pic, svac3_pool_t *pool)
+{
+    pic->p.pool = pic->r.pool = pool;
+    /* with threads to spare, reconstruction runs beside the parser */
+    if (pool && pic->p.recon && !pic->threaded && !pic->p.next_patch) {
+        if (pthread_mutex_init(&pic->lock, NULL))
+            return;
+        if (pthread_cond_init(&pic->ready, NULL)) {
+            pthread_mutex_destroy(&pic->lock);
+            return;
+        }
+        pic->threaded = 1;
+        if (pthread_create(&pic->worker, NULL, recon_worker, pic)) {
+            pthread_mutex_destroy(&pic->lock);
+            pthread_cond_destroy(&pic->ready);
+            pic->threaded = 0;
+        }
+    }
 }
 
 int svac3_picture_patch(svac3_picture_t *pic, const svac3_hls_t *hls, const uint8_t *data,
@@ -1434,16 +1806,25 @@ int svac3_picture_patch(svac3_picture_t *pic, const svac3_hls_t *hls, const uint
 
 int svac3_picture_end(svac3_picture_t *pic, const svac3_hls_t *hls)
 {
+    return svac3_picture_end_cached(pic, hls, NULL);
+}
+
+int svac3_picture_end_cached(svac3_picture_t *pic, const svac3_hls_t *hls,
+                             svac3_picture_cache_t *cache)
+{
     parser_t *p = &pic->p;
     int ret = SVAC3_OK;
 
+    finish_worker(pic);                         /* every record reconstructed */
     if (p->next_patch != p->num_patches)
         ret = SVAC3_ERR_CORRUPT;                /* patches missing */
+    else if (pic->failed)
+        ret = SVAC3_ERR_NOMEM;
     else if (p->recon)
-        ret = loop_filters(p, hls);
+        ret = loop_filters(&pic->r, hls);
     if (ret == SVAC3_OK && p->tmv_out)
-        store_tmv(p, p->tmv_out);
-    svac3_picture_free(pic);
+        store_tmv(p->recon ? &pic->r : p, p->tmv_out);
+    svac3_picture_release(pic, cache);
     return ret;
 }
 

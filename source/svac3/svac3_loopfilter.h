@@ -10,6 +10,7 @@
 #include <stdint.h>
 
 #include "svac3_recon.h"
+#include "svac3_pool.h"
 
 /* What the deblocking filter needs per 4x4 luma unit. */
 typedef struct {
@@ -31,7 +32,7 @@ typedef struct {
  * edge. 5.4.11.1 as printed filters each 8x8 block's vertical then
  * horizontal edge in raster order; only the picture-wide order reproduces
  * the reference decoder (docs/errata.md). */
-void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d);
+void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d, svac3_pool_t *pool);
 
 /* Basic SAO parameters of one component of one LCU (5.4.12.1.3). */
 typedef struct {
@@ -45,6 +46,6 @@ typedef struct {
  * -1 if a working copy of a plane could not be allocated (frame untouched
  * from that plane on). */
 int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size,
-               int lcu_w, int lcu_h);
+               int lcu_w, int lcu_h, svac3_pool_t *pool);
 
 #endif /* SVAC3_LOOPFILTER_H */
