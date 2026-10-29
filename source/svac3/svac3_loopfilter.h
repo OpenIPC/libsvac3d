@@ -34,6 +34,14 @@ typedef struct {
  * the reference decoder (docs/errata.md). */
 void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d, svac3_pool_t *pool);
 
+/* The same for luma rows [y0, y1) and the chroma rows under them: their
+ * vertical edges, then the horizontal edges positioned in them. y0 and y1
+ * are multiples of 16; called on consecutive ranges from the top, the
+ * result is that of svac3_deblock(). The info covers the rows' units and
+ * the row of units above. */
+void svac3_deblock_rows(svac3_frame_t *f, const svac3_dbk_info_t *d, int y0, int y1,
+                        svac3_pool_t *pool);
+
 /* Basic SAO parameters of one component of one LCU (5.4.12.1.3). */
 typedef struct {
     uint8_t mode;                /* 0 off, 1 interval, 2 edge */
@@ -47,5 +55,11 @@ typedef struct {
  * from that plane on). */
 int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size,
                int lcu_w, int lcu_h, svac3_pool_t *pool);
+
+/* SAO for LCU rows [r0, r1) with src[c] holding deblocked samples of the
+ * rows they read, at the frame's layout (stride and offsets): the shifted
+ * LCU rows and one row above and below them. */
+void svac3_sao_rows(svac3_frame_t *f, uint8_t *const src[3], const svac3_sao_t (*sao)[3],
+                    int lcu_size, int lcu_w, int lcu_h, int r0, int r1, svac3_pool_t *pool);
 
 #endif /* SVAC3_LOOPFILTER_H */
