@@ -1,0 +1,46 @@
+From c1be29e1ed018240eb8efe29a3a0bedfd0f166e7 Mon Sep 17 00:00:00 2001
+From: Dmitry Ilyin <d.ilyin@openipc.org>
+Date: Thu, 29 Oct 2026 17:21:38 +0300
+Subject: [PATCH] avformat/mpeg: read SVAC video from a GB/T 28181 program
+ stream
+
+GB/T 28181 maps SVAC video as stream_type 0x80 in a program stream's
+map. That value is user-private in ISO/IEC 13818-1, so it is taken as
+SVAC only on a video stream id.
+---
+ libavformat/mpeg.c | 4 ++++
+ libavformat/mpeg.h | 3 +++
+ 2 files changed, 7 insertions(+)
+
+diff --git a/libavformat/mpeg.c b/libavformat/mpeg.c
+index 29abe32..232044a 100644
+--- a/libavformat/mpeg.c
++++ b/libavformat/mpeg.c
+@@ -553,6 +553,10 @@ redo:
+     } else if (es_type == STREAM_TYPE_VIDEO_VVC) {
+         codec_id = AV_CODEC_ID_VVC;
+         type     = AVMEDIA_TYPE_VIDEO;
++    } else if (es_type == STREAM_TYPE_VIDEO_SVAC &&
++               startcode >= 0x1e0 && startcode <= 0x1ef) {
++        codec_id = AV_CODEC_ID_SVAC3;
++        type     = AVMEDIA_TYPE_VIDEO;
+     } else if (es_type == STREAM_TYPE_AUDIO_AC3) {
+         codec_id = AV_CODEC_ID_AC3;
+         type     = AVMEDIA_TYPE_AUDIO;
+diff --git a/libavformat/mpeg.h b/libavformat/mpeg.h
+index 20592eb..138e8d9 100644
+--- a/libavformat/mpeg.h
++++ b/libavformat/mpeg.h
+@@ -58,6 +58,9 @@
+ #define STREAM_TYPE_VIDEO_HEVC      0x24
+ #define STREAM_TYPE_VIDEO_VVC       0x33
+ #define STREAM_TYPE_VIDEO_CAVS      0x42
++/* GB/T 28181: SVAC video in a program stream's map. A user-private value,
++ * so it is taken as SVAC only on a video stream id. */
++#define STREAM_TYPE_VIDEO_SVAC      0x80
+ 
+ #define STREAM_TYPE_AUDIO_AC3       0x81
+ 
+-- 
+2.54.0
+

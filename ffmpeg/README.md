@@ -1,10 +1,12 @@
 # FFmpeg support
 
-Two patches, applied in order to FFmpeg 9.0 (tag `n9.0.2`).
+Three patches, applied in order to FFmpeg 9.0 (tag `n9.0.2`).
 `0001-avcodec-add-SVAC-3.0-decoding-via-libsvac3d.patch` adds SVAC 3.0
 decoding, in the shape of the `libuavs3d` wrapper.
 `0002-avformat-rtpdec-add-an-RTP-depacketizer-for-SVAC-3.0.patch` adds
 receiving it over RTP and RTSP.
+`0003-avformat-mpeg-read-SVAC-video-from-a-GB-T-28181-program-stream.patch`
+reads it from an MPEG-2 program stream, as GB/T 28181 carries it.
 
 | Piece | Files |
 |---|---|
@@ -13,6 +15,7 @@ receiving it over RTP and RTSP.
 | parser, one access unit per packet | `libavcodec/svac3_parser.c`, `svac3.h` |
 | raw demuxer, `.svac` / `.svac3` | `libavformat/svac3dec.c` |
 | RTP depacketizer, `SVAC3/90000` | `libavformat/rtpdec_svac3.c` |
+| program stream map type 0x80 | `libavformat/mpeg.c`, `mpeg.h` |
 
 ## Build
 
@@ -42,7 +45,12 @@ ffmpeg/check_framemd5.py tests/golden/cv608_synth_1080p_cbr2m.framemd5 out.frame
 local UDP (`ffmpeg/rtp_send.py`), receives it through an SDP, and holds the
 result to the same golden hashes.
 
-CI builds a minimal FFmpeg this way and runs both checks on every change.
+`ffmpeg/ps_check.sh path/to/ffmpeg` writes every corpus stream as a
+program stream (`ffmpeg/ps_write.py`) and reads it back with `-f mpeg`,
+against the same hashes.
+
+CI builds a minimal FFmpeg this way and runs all three checks on every
+change.
 
 ## RTP
 
@@ -79,3 +87,12 @@ depacketizer reads the one OpenIPC cameras send over RTSP, which is RFC
 - A P picture whose reference was lost (decoding from the middle of a
   stream, or after a seek) is an `AVERROR_INVALIDDATA` until the next I
   picture.
+
+## Program stream (GB/T 28181)
+
+GB/T 28181 carries video as an MPEG-2 program stream, with SVAC named
+`stream_type` 0x80 in the program stream map. That value is user-private in
+ISO/IEC 13818-1, so 0003 reads it as SVAC only on a video stream id
+(0xE0-0xEF). `ffmpeg -f mpeg -i capture.ps` then decodes a capture. RTP
+carrying a program stream (`PS/90000`) has no depacketizer in FFmpeg; save
+the payloads and read the result as a file.

@@ -115,7 +115,7 @@ jobs:
           PKG_CONFIG_PATH="$GITHUB_WORKSPACE/prefix/lib/pkgconfig" ../ffmpeg-src/configure \
             --disable-everything --disable-doc --disable-autodetect --disable-x86asm \
             --enable-libsvac3d --enable-decoder=libsvac3d --enable-parser=svac3 \
-            --enable-demuxer=svac3,sdp,rtsp,rtp --enable-protocol=file,udp,rtp,tcp \
+            --enable-demuxer=svac3,sdp,rtsp,rtp,mpegps --enable-protocol=file,udp,rtp,tcp \
             --enable-muxer=framemd5 --enable-encoder=rawvideo \
             --enable-filter=null,format --extra-cflags=-Werror=implicit-function-declaration
           make -j"$(nproc)" ffmpeg
@@ -135,3 +135,5 @@ jobs:
           # sprop-sps and sprop-pps on fmtp lines of their own, and no
           # parameter set in band: the SDP is all the decoder gets.
           ffmpeg/rtp_check.sh ffbuild/ffmpeg 1200 split
+      - name: framemd5 from a GB/T 28181 program stream equals the golden hashes
+        run: ffmpeg/ps_check.sh ffbuild/ffmpeg
