@@ -6,6 +6,7 @@
  */
 #include "svac3_recon.h"
 #include "svac3_tables.h"
+#include "svac3_dsp.h"
 
 #include <string.h>
 
@@ -313,7 +314,7 @@ int svac3_chroma_qp(int qp, int delta)
 
 void svac3_dequant_itrans(const int16_t *quant, int M1, int M2, int qp, int16_t *resid)
 {
-    int32_t coef[64 * 64], k[64 * 64];
+    int32_t coef[64 * 64];
     const int m = ilog2(M1 * M2) / 2;
     const int shift = dq_shift[qp] + m + BIT_DEPTH - 14;
     const int rect = (M1 == 2 * M2) || (M2 == 2 * M1) || (M1 == 8 * M2) || (M2 == 8 * M1);
@@ -337,25 +338,33 @@ void svac3_dequant_itrans(const int16_t *quant, int M1, int M2, int qp, int16_t 
         }
     }
 
-    /* vertical: K[x][y] = sum_k T_M2[k][y] * C[x][k], then (+16) >> 5 */
+    if (!nx) {
+        memset(resid, 0, sizeof(*resid) * (size_t)M1 * M2);
+        return;
+    }
+    const svac3_dsp_t *dsp = svac3_dsp();
     const int8_t *tv = dct2(M2), *th = dct2(M1);
-    for (int x = 0; x < nx; x++)
-        for (int y = 0; y < M2; y++) {
-            int64_t s = 0;
-            for (int kk = 0; kk < ny; kk++)
-                s += (int64_t)tv[kk * M2 + y] * coef[kk * M1 + x];
-            k[y * M1 + x] = clip3(-32768, 32767, (int)((s + 16) >> 5));
-        }
-    /* horizontal: H[x][y] = sum_k K[k][y] * T_M1[k][x], then round >> (20 - BitDepth) */
-    const int shift1 = 20 - BIT_DEPTH, maxv = (1 << BIT_DEPTH) - 1;
+    int16_t cq[64 * 64], a[64 * 64], b[64 * 64], kk[64 * 64];
+
+    /* vertical: K[x][y] = sum_k T_M2[k][y] * C[x][k], then (+16) >> 5, as
+     * the product of T_M2 transposed (M2 x ny) and C (ny x cols); columns
+     * past nx are zero, so cols may round nx up for the kernel */
+    const int cols = M1 == 4 ? 4 : (nx + 7) & ~7;
     for (int y = 0; y < M2; y++)
-        for (int x = 0; x < M1; x++) {
-            int64_t s = 0;
-            for (int kk = 0; kk < nx; kk++)
-                s += (int64_t)k[y * M1 + kk] * th[kk * M1 + x];
-            resid[y * M1 + x] = (int16_t)clip3(-maxv - 1, maxv,
-                                               (int)((s + (1 << (shift1 - 1))) >> shift1));
-        }
+        for (int k = 0; k < ny; k++)
+            a[y * ny + k] = tv[k * M2 + y];
+    for (int k = 0; k < ny; k++)
+        for (int x = 0; x < cols; x++)
+            cq[k * cols + x] = (int16_t)coef[k * M1 + x];
+    dsp->matmul(kk, cols, a, ny, cq, cols, M2, ny, cols, 5, -32768, 32767);
+
+    /* horizontal: H[x][y] = sum_k K[k][y] * T_M1[k][x], then rounded
+     * >> (20 - BitDepth), as the product of K (M2 x nx) and T_M1 (nx x M1) */
+    const int shift1 = 20 - BIT_DEPTH, maxv = (1 << BIT_DEPTH) - 1;
+    for (int k = 0; k < nx; k++)
+        for (int x = 0; x < M1; x++)
+            b[k * M1 + x] = th[k * M1 + x];
+    dsp->matmul(resid, M1, kk, cols, b, M1, M2, nx, M1, shift1, -maxv - 1, maxv);
 }
 
 void svac3_put_block(svac3_frame_t *f, int c, int x0, int y0, int M, int N,
@@ -363,6 +372,17 @@ void svac3_put_block(svac3_frame_t *f, int c, int x0, int y0, int M, int N,
 {
     uint8_t *dst = f->plane[c];
     const int s = f->stride[c];
+    if (x0 + M <= f->width[c] && y0 + N <= f->height[c]) {
+        uint8_t *d = dst + (size_t)y0 * s + x0;
+        if (resid) {
+            svac3_dsp()->add_block(d, s, pred, resid, M, N);
+        } else {
+            for (int y = 0; y < N; y++)
+                memcpy(d + (size_t)y * s, pred + y * M, (size_t)M);
+        }
+        return;
+    }
+    /* a block crossing the picture's edge: only its part inside */
     for (int y = 0; y < N && y0 + y < f->height[c]; y++)
         for (int x = 0; x < M && x0 + x < f->width[c]; x++)
             dst[(y0 + y) * s + x0 + x] =

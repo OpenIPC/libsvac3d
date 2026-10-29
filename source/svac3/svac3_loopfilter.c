@@ -5,6 +5,7 @@
  * picture is a single patch, so patch boundaries never stop a filter.
  */
 #include "svac3_loopfilter.h"
+#include "svac3_dsp.h"
 
 #include <stdlib.h>
 #include <string.h>
@@ -33,12 +34,6 @@ static inline int unit(const svac3_dbk_info_t *d, int x, int y)
     return (y >> 2) * d->stride + (x >> 2);
 }
 
-/* A luma sample pair across an edge lies on a coding-unit boundary. */
-static inline int cu_edge(const svac3_dbk_info_t *d, int xp, int yp, int xq, int yq)
-{
-    return d->cu_id[unit(d, xp, yp)] != d->cu_id[unit(d, xq, yq)];
-}
-
 /* 5.4.11.4, first paragraph: an edge between two inter coding units with
  * no coefficients, the same reference and motion vectors less than one
  * sample apart has Bs 0 (P pictures: list 1 is unused on both sides). */
@@ -50,147 +45,67 @@ static int inter_bs0(const svac3_dbk_info_t *d, int up, int uq)
            iabs(d->mv[2 * up + 1] - d->mv[2 * uq + 1]) < 4;
 }
 
-/* 5.4.11.4 (intra in both coding units: Bs from the samples) and the
- * filters of 5.4.11.5-5.4.11.10. s points at q0; step is the distance
- * between p0 and q0 (1 for a vertical edge, stride for a horizontal one). */
-static void filter_line(uint8_t *s, int step, int qpav, const svac3_dbk_info_t *d, int chroma)
+/* Deblocking parameters of the 4x4 unit pair across an edge (P on the left
+ * or above): alpha < 0 when the edge is not filtered */
+static void edge_params(const svac3_dbk_info_t *d, int xp, int yp, int xq, int yq,
+                        int chroma_delta, int chroma, int *alpha, int *beta)
 {
-    const int p0 = s[-step], p1 = s[-2 * step], p2 = s[-3 * step];
-    const int q0 = s[0], q1 = s[step], q2 = s[2 * step];
-    const int iA = clip3(0, 63, qpav + d->alpha_offset), iB = clip3(0, 63, qpav + d->beta_offset);
-    const int alpha = alpha_tab[iA], beta = beta_tab[iB];
-    int fL = 0, fR = 0, bs;
-
-    if (d->filter_type == 1 && iabs(p0 - q0) >= 4)
+    const int up = unit(d, xp, yp), uq = unit(d, xq, yq);
+    *alpha = *beta = -1;
+    if (d->cu_id[up] == d->cu_id[uq] || inter_bs0(d, up, uq))
         return;
-    if (iabs(p0 - p1) < beta)
-        fL += 2;
-    if (iabs(p0 - p2) < beta)
-        fL++;
-    if (iabs(q0 - q1) < beta)
-        fR += 2;
-    if (iabs(q0 - q2) < beta)
-        fR++;
-    switch (fL + fR) {
-    case 6:
-        bs = (iabs(p0 - p1) <= beta / 4 && iabs(q0 - q1) <= beta / 4 && iabs(p0 - q0) < alpha) ? 4 : 3;
-        if (d->filter_type == 1 && bs == 4 &&
-            !(iabs(p0 - s[-4 * step]) <= beta / 2 && iabs(q0 - s[3 * step]) <= beta / 2))
-            bs = 3;
-        break;
-    case 5:
-        bs = (p0 == p1 && q0 == q1) ? 3 : 2;
-        if (d->filter_type == 1 && bs == 3 && !(iabs(p2 - q2) < alpha))
-            bs = 2;
-        break;
-    case 4:
-        bs = fL == 2 ? 2 : 1;
-        break;
-    case 3:
-        bs = iabs(p1 - q1) < beta ? 1 : 0;
-        break;
-    default:
-        bs = 0;
-        break;
-    }
-    if (chroma && bs)
-        bs--;
-    if (!bs)
-        return;
-
-    if (chroma) {
-        s[-step] = (uint8_t)((p1 * 3 + p0 * 10 + q0 * 3 + 8) >> 4);
-        s[0] = (uint8_t)((p0 * 3 + q0 * 10 + q1 * 3 + 8) >> 4);
-        if (bs == 3) {
-            s[-2 * step] = (uint8_t)((p2 * 3 + p1 * 8 + p0 * 3 + q0 * 2 + 8) >> 4);
-            s[step] = (uint8_t)((q2 * 3 + q1 * 8 + q0 * 3 + p0 * 2 + 8) >> 4);
-        }
-        return;
-    }
-    const int p3 = s[-4 * step], q3 = s[3 * step];
-    switch (bs) {
-    case 4:
-        s[-step]     = (uint8_t)((p2 * 3 + p1 * 8 + p0 * 10 + q0 * 8 + q1 * 3 + 16) >> 5);
-        s[-2 * step] = (uint8_t)((p2 * 4 + p1 * 5 + p0 * 4 + q0 * 3 + 8) >> 4);
-        s[-3 * step] = (uint8_t)((p3 * 2 + p2 * 2 + p1 * 2 + p0 + q0 + 4) >> 3);
-        s[0]         = (uint8_t)((p1 * 3 + p0 * 8 + q0 * 10 + q1 * 8 + q2 * 3 + 16) >> 5);
-        s[step]      = (uint8_t)((p0 * 3 + q0 * 4 + q1 * 5 + q2 * 4 + 8) >> 4);
-        s[2 * step]  = (uint8_t)((p0 + q0 + q1 * 2 + q2 * 2 + q3 * 2 + 4) >> 3);
-        break;
-    case 3:
-        s[-step]     = (uint8_t)((p2 + (p1 << 2) + (p0 << 2) + (p0 << 1) + (q0 << 2) + q1 + 8) >> 4);
-        s[-2 * step] = (uint8_t)(((p2 << 1) + p2 + (p1 << 3) + (p0 << 2) + q0 + 8) >> 4);
-        s[0]         = (uint8_t)((p1 + (p0 << 2) + (q0 << 2) + (q0 << 1) + (q1 << 2) + q2 + 8) >> 4);
-        s[step]      = (uint8_t)(((q2 << 1) + q2 + (q1 << 3) + (q0 << 2) + p0 + 8) >> 4);
-        break;
-    case 2:
-        s[-step] = (uint8_t)(((p1 << 1) + p1 + (p0 << 3) + (p0 << 1) + (q0 << 1) + q0 + 8) >> 4);
-        s[0]     = (uint8_t)(((p0 << 1) + p0 + (q0 << 3) + (q0 << 1) + (q1 << 1) + q1 + 8) >> 4);
-        break;
-    case 1:
-        s[-step] = (uint8_t)(((p0 << 1) + p0 + q0 + 2) >> 2);
-        s[0]     = (uint8_t)(((q0 << 1) + q0 + p0 + 2) >> 2);
-        break;
-    }
+    int qpav;
+    if (chroma)
+        qpav = (svac3_chroma_qp(d->qp[up], chroma_delta) + svac3_chroma_qp(d->qp[uq], chroma_delta) + 1) >> 1;
+    else
+        qpav = (d->qp[up] + d->qp[uq] + 1) >> 1;
+    *alpha = alpha_tab[clip3(0, 63, qpav + d->alpha_offset)];
+    *beta = beta_tab[clip3(0, 63, qpav + d->beta_offset)];
 }
 
-/* luma edges of the 8x8 filter block at (bx, by): ver = vertical edge */
-static void luma_edge(svac3_frame_t *f, const svac3_dbk_info_t *d, int bx, int by, int ver)
+/* All vertical, then all horizontal edges of one plane: edges 8 samples
+ * apart touch disjoint samples, so each run of 8 lines across one edge is
+ * filtered at once, with the parameters of each 4x4 luma unit pair (4 luma
+ * or 2 chroma lines). */
+static void plane_edges(svac3_frame_t *f, const svac3_dbk_info_t *d, int c, int ver,
+                        const svac3_dsp_t *dsp)
 {
-    uint8_t *Y = f->plane[0];
-    const int s = f->stride[0];
-    if (ver ? bx == 0 : by == 0)
-        return;                              /* picture boundary */
-    for (int i = 0; i < 8; i++) {
-        const int x = ver ? bx : bx + i, y = ver ? by + i : by;
-        if (x >= d->pic_w || y >= d->pic_h)
-            break;
-        const int xp = ver ? x - 1 : x, yp = ver ? y : y - 1;
-        if (!cu_edge(d, xp, yp, x, y) || inter_bs0(d, unit(d, xp, yp), unit(d, x, y)))
-            continue;
-        const int qpav = (d->qp[unit(d, xp, yp)] + d->qp[unit(d, x, y)] + 1) >> 1;
-        filter_line(Y + y * s + x, ver ? 1 : s, qpav, d, 0);
-    }
-}
+    uint8_t *P = f->plane[c];
+    const ptrdiff_t s = f->stride[c];
+    const int W = f->width[c], H = f->height[c], chroma = c != 0;
+    const int group = chroma ? 2 : 4, sc = chroma ? 2 : 1;
+    const int delta = c == 1 ? d->cb_delta : c == 2 ? d->cr_delta : 0;
+    int alpha[4], beta[4];
 
-static void chroma_edge(svac3_frame_t *f, const svac3_dbk_info_t *d, int bx, int by, int ver)
-{
-    if (ver ? bx == 0 : by == 0)
-        return;
-    for (int c = 1; c <= 2; c++) {
-        uint8_t *P = f->plane[c];
-        const int s = f->stride[c], delta = c == 1 ? d->cb_delta : d->cr_delta;
-        for (int i = 0; i < 8; i++) {
-            const int x = ver ? bx : bx + i, y = ver ? by + i : by;
-            if (x >= f->width[c] || y >= f->height[c])
-                break;
-            const int lx = 2 * x, ly = 2 * y;
-            const int lxp = ver ? lx - 1 : lx, lyp = ver ? ly : ly - 1;
-            if (!cu_edge(d, lxp, lyp, lx, ly) || inter_bs0(d, unit(d, lxp, lyp), unit(d, lx, ly)))
+    for (int e = 8; e < (ver ? W : H); e += 8)           /* the edge's position */
+        for (int a = 0; a < (ver ? H : W); a += 8) {     /* along it */
+            const int n = (ver ? H : W) - a < 8 ? (ver ? H : W) - a : 8;
+            int any = 0;
+            for (int g = 0; g * group < n; g++) {
+                const int along = (a + g * group) * sc, across = e * sc;
+                if (ver)
+                    edge_params(d, across - 1, along, across, along, delta, chroma, &alpha[g], &beta[g]);
+                else
+                    edge_params(d, along, across - 1, along, across, delta, chroma, &alpha[g], &beta[g]);
+                any |= alpha[g] >= 0;
+            }
+            if (!any)
                 continue;
-            const int qpp = svac3_chroma_qp(d->qp[unit(d, lxp, lyp)], delta);
-            const int qpq = svac3_chroma_qp(d->qp[unit(d, lx, ly)], delta);
-            filter_line(P + y * s + x, ver ? 1 : s, (qpp + qpq + 1) >> 1, d, 1);
+            uint8_t *q0 = ver ? P + (size_t)a * s + e : P + (size_t)e * s + a;
+            dsp->deblock(q0, ver ? 1 : s, ver ? s : 1, n, group, alpha, beta, chroma,
+                         d->filter_type);
         }
-    }
 }
 
 void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d)
 {
-    const int lw = d->pic_w, lh = d->pic_h, cw = f->width[1], ch = f->height[1];
-
-    for (int by = 0; by < lh; by += 8)
-        for (int bx = 0; bx < lw; bx += 8)
-            luma_edge(f, d, bx, by, 1);
-    for (int by = 0; by < lh; by += 8)
-        for (int bx = 0; bx < lw; bx += 8)
-            luma_edge(f, d, bx, by, 0);
-    for (int by = 0; by < ch; by += 8)
-        for (int bx = 0; bx < cw; bx += 8)
-            chroma_edge(f, d, bx, by, 1);
-    for (int by = 0; by < ch; by += 8)
-        for (int bx = 0; bx < cw; bx += 8)
-            chroma_edge(f, d, bx, by, 0);
+    const svac3_dsp_t *dsp = svac3_dsp();
+    plane_edges(f, d, 0, 1, dsp);
+    plane_edges(f, d, 0, 0, dsp);
+    for (int c = 1; c <= 2; c++)
+        plane_edges(f, d, c, 1, dsp);
+    for (int c = 1; c <= 2; c++)
+        plane_edges(f, d, c, 0, dsp);
 }
 
 /* ------------------------------------------------------------------------ */
