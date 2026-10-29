@@ -254,6 +254,89 @@ static void deblock_neon(uint8_t *s, ptrdiff_t step, ptrdiff_t lstep, int n, int
     }
 }
 
+/* Angular intra prediction rows: the four taps in 32-bit lanes */
+static void ipred_row_neon(uint8_t *dst, const int16_t *ref, int w, const int8_t *t, int rnd, int shift)
+{
+    if (w & 3) {
+        svac3_dsp_c.ipred_row(dst, ref, w, t, rnd, shift);
+        return;
+    }
+    const int32x4_t r4 = vdupq_n_s32(rnd), sh = vdupq_n_s32(-shift);
+    int x = 0;
+    for (; x + 8 <= w; x += 8) {
+        int32x4_t l = r4, h = r4;
+        for (int k = 0; k < 4; k++) {
+            const int16x8_t v = vld1q_s16(ref + x + k);
+            l = vmlal_n_s16(l, vget_low_s16(v), t[k]);
+            h = vmlal_n_s16(h, vget_high_s16(v), t[k]);
+        }
+        const int16x8_t s16 = vcombine_s16(vqmovn_s32(vshlq_s32(l, sh)), vqmovn_s32(vshlq_s32(h, sh)));
+        vst1_u8(dst + x, vqmovun_s16(s16));
+    }
+    if (x < w) {                                          /* 4 left */
+        int32x4_t l = r4;
+        for (int k = 0; k < 4; k++)
+            l = vmlal_n_s16(l, vld1_s16(ref + x + k), t[k]);
+        const int16x4_t s4 = vqmovn_s32(vshlq_s32(l, sh));
+        const uint8x8_t u = vqmovun_s16(vcombine_s16(s4, s4));
+        vst1_lane_u32((uint32_t *)(void *)(dst + x), vreinterpret_u32_u8(u), 0);
+    }
+}
+
+/* SAO */
+
+/* -1 / 0 / +1 per byte: the sign of a - b */
+static inline int8x16_t sign8(uint8x16_t a, uint8x16_t b)
+{
+    return vsubq_s8(vreinterpretq_s8_u8(vcltq_u8(a, b)), vreinterpretq_s8_u8(vcgtq_u8(a, b)));
+}
+
+/* v + o (signed bytes), clipped to 0..255 */
+static inline uint8x16_t add_clip(uint8x16_t v, int8x16_t o)
+{
+    const int16x8_t l = vaddq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_low_u8(v))), vmovl_s8(vget_low_s8(o)));
+    const int16x8_t h = vaddq_s16(vreinterpretq_s16_u16(vmovl_u8(vget_high_u8(v))), vmovl_s8(vget_high_s8(o)));
+    return vcombine_u8(vqmovun_s16(l), vqmovun_s16(h));
+}
+
+static void sao_edge_neon(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int w, int h,
+                          ptrdiff_t na, ptrdiff_t nb, const int8_t offset[5])
+{
+    int8_t tab[16] = { 0 };
+    memcpy(tab, offset, 5);
+    const int8x16_t lut = vld1q_s8(tab), two = vdupq_n_s8(2);
+    for (int y = 0; y < h; y++) {
+        const uint8_t *c = src + y * stride;
+        uint8_t *d = dst + y * stride;
+        int x = 0;
+        for (; x + 16 <= w; x += 16) {
+            const uint8x16_t v = vld1q_u8(c + x);
+            const int8x16_t cls = vaddq_s8(vaddq_s8(sign8(v, vld1q_u8(c + x + na)),
+                                                    sign8(v, vld1q_u8(c + x + nb))), two);
+            vst1q_u8(d + x, add_clip(v, vqtbl1q_s8(lut, vreinterpretq_u8_s8(cls))));
+        }
+        if (x < w)
+            svac3_dsp_c.sao_edge(d + x, c + x, stride, w - x, 1, na, nb, offset);
+    }
+}
+
+static void sao_band_neon(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int w, int h,
+                          const int8_t band[32])
+{
+    const int8x16x2_t lut = { { vld1q_s8(band), vld1q_s8(band + 16) } };
+    for (int y = 0; y < h; y++) {
+        const uint8_t *c = src + y * stride;
+        uint8_t *d = dst + y * stride;
+        int x = 0;
+        for (; x + 16 <= w; x += 16) {
+            const uint8x16_t v = vld1q_u8(c + x);
+            vst1q_u8(d + x, add_clip(v, vqtbl2q_s8(lut, vshrq_n_u8(v, 3))));
+        }
+        if (x < w)
+            svac3_dsp_c.sao_band(d + x, c + x, stride, w - x, 1, band);
+    }
+}
+
 const svac3_dsp_t svac3_dsp_neon = {
     .name = "neon",
     .matmul = matmul_neon,
@@ -262,4 +345,7 @@ const svac3_dsp_t svac3_dsp_neon = {
     .mc_v = mc_v_neon,
     .mc_hv = mc_hv_neon,
     .deblock = deblock_neon,
+    .ipred_row = ipred_row_neon,
+    .sao_edge = sao_edge_neon,
+    .sao_band = sao_band_neon,
 };

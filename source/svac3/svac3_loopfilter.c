@@ -113,6 +113,7 @@ void svac3_deblock(svac3_frame_t *f, const svac3_dbk_info_t *d)
 
 int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size, int lcu_w, int lcu_h)
 {
+    const svac3_dsp_t *dsp = svac3_dsp();
     for (int c = 0; c < 3; c++) {
         const int W = f->width[c], H = f->height[c], s = f->stride[c];
         const int L = c ? lcu_size / 2 : lcu_size;
@@ -139,38 +140,31 @@ int svac3_sao(svac3_frame_t *f, const svac3_sao_t (*sao)[3], int lcu_size, int l
                 if (ly == lcu_h - 1 || y1 > H)
                     y1 = H;
 
+                const ptrdiff_t off = (ptrdiff_t)y0 * s + x0;
                 if (p->mode == 1) {
-                    int band[32] = { 0 };
+                    int8_t band[32] = { 0 };
                     band[p->start_pos] = p->offset[0];
                     band[(p->start_pos + 1) % 32] = p->offset[1];
                     band[(p->start_pos + p->delta_pos_minus2 + 2) % 32] = p->offset[2];
                     band[(p->start_pos + p->delta_pos_minus2 + 3) % 32] = p->offset[3];
-                    for (int y = y0; y < y1; y++)
-                        for (int x = x0; x < x1; x++)
-                            dst[y * s + x] = (uint8_t)clip1(src[y * s + x] + band[src[y * s + x] >> 3]);
+                    dsp->sao_band(dst + off, src + off, s, x1 - x0, y1 - y0, band);
                 } else {
+                    /* neighbours a and b of each sample; a sample with one
+                     * outside the picture is left as it is, so the region
+                     * shrinks to those with both inside */
                     static const int dx[4][2] = { { -1, 1 }, { 0, 0 }, { -1, 1 }, { 1, -1 } };
                     static const int dy[4][2] = { { 0, 0 }, { -1, 1 }, { -1, 1 }, { -1, 1 } };
                     const int t = p->edge_type;
-                    for (int y = y0; y < y1; y++)
-                        for (int x = x0; x < x1; x++) {
-                            const int ax = x + dx[t][0], ay = y + dy[t][0];
-                            const int bx = x + dx[t][1], by = y + dy[t][1];
-                            if (ax < 0 || ay < 0 || ax >= W || ay >= H ||
-                                bx < 0 || by < 0 || bx >= W || by >= H)
-                                continue;
-                            const int xc = src[y * s + x], xa = src[ay * s + ax], xb = src[by * s + bx];
-                            int o = 0;
-                            if (xc < xa && xc < xb)
-                                o = p->offset[0];
-                            else if ((xc < xa && xc == xb) || (xc == xa && xc < xb))
-                                o = p->offset[1];
-                            else if ((xc > xa && xc == xb) || (xc == xa && xc > xb))
-                                o = p->offset[2];
-                            else if (xc > xa && xc > xb)
-                                o = p->offset[3];
-                            dst[y * s + x] = (uint8_t)clip1(xc + o);
-                        }
+                    const int ex = dx[t][0] != 0, ey = dy[t][0] != 0;
+                    const int xs = x0 > ex ? x0 : ex, xe = x1 < W - ex ? x1 : W - ex;
+                    const int ys = y0 > ey ? y0 : ey, ye = y1 < H - ey ? y1 : H - ey;
+                    if (xs >= xe || ys >= ye)
+                        continue;
+                    const int8_t o[5] = { (int8_t)p->offset[0], (int8_t)p->offset[1], 0,
+                                          (int8_t)p->offset[2], (int8_t)p->offset[3] };
+                    const ptrdiff_t at = (ptrdiff_t)ys * s + xs;
+                    dsp->sao_edge(dst + at, src + at, s, xe - xs, ye - ys,
+                                  dy[t][0] * (ptrdiff_t)s + dx[t][0], dy[t][1] * (ptrdiff_t)s + dx[t][1], o);
                 }
             }
         free(src);

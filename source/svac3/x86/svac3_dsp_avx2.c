@@ -415,6 +415,114 @@ static void deblock_avx2(uint8_t *s, ptrdiff_t step, ptrdiff_t lstep, int n, int
     }
 }
 
+/* ------------------------------------------------------------------------ */
+/* Angular intra prediction rows: the four taps in 32-bit lanes. */
+
+static inline __m128i ipred4(const int16_t *r, const __m128i t[4], __m128i rnd, __m128i sh)
+{
+    __m128i acc = rnd;
+    for (int k = 0; k < 4; k++)
+        acc = _mm_add_epi32(acc, _mm_mullo_epi32(_mm_cvtepi16_epi32(_mm_loadl_epi64((const __m128i *)(r + k))), t[k]));
+    return _mm_sra_epi32(acc, sh);
+}
+
+static void ipred_row_avx2(uint8_t *dst, const int16_t *ref, int w, const int8_t *t, int rnd, int shift)
+{
+    if (w & 3) {
+        svac3_dsp_c.ipred_row(dst, ref, w, t, rnd, shift);
+        return;
+    }
+    const __m128i sh = _mm_cvtsi32_si128(shift);
+    int x = 0;
+    if (w >= 8) {
+        __m256i tv[4];
+        for (int k = 0; k < 4; k++)
+            tv[k] = _mm256_set1_epi32(t[k]);
+        const __m256i r8 = _mm256_set1_epi32(rnd);
+        for (; x + 8 <= w; x += 8) {
+            __m256i acc = r8;
+            for (int k = 0; k < 4; k++)
+                acc = _mm256_add_epi32(acc, _mm256_mullo_epi32(
+                    _mm256_cvtepi16_epi32(_mm_loadu_si128((const __m128i *)(ref + x + k))), tv[k]));
+            acc = _mm256_sra_epi32(acc, sh);
+            const __m128i v = _mm_packs_epi32(_mm256_castsi256_si128(acc), _mm256_extracti128_si256(acc, 1));
+            _mm_storel_epi64((__m128i *)(dst + x), _mm_packus_epi16(v, v));
+        }
+    }
+    if (x < w) {                                          /* 4 left */
+        __m128i tq[4];
+        for (int k = 0; k < 4; k++)
+            tq[k] = _mm_set1_epi32(t[k]);
+        const __m128i v = ipred4(ref + x, tq, _mm_set1_epi32(rnd), sh);
+        const __m128i p = _mm_packs_epi32(v, v);
+        const int out = _mm_cvtsi128_si32(_mm_packus_epi16(p, p));
+        memcpy(dst + x, &out, 4);
+    }
+}
+
+/* ------------------------------------------------------------------------ */
+/* SAO */
+
+/* -1 / 0 / +1 per byte: the sign of a - b, unsigned bytes */
+static inline __m128i sign8(__m128i a, __m128i b)
+{
+    const __m128i k80 = _mm_set1_epi8((char)0x80);
+    const __m128i as = _mm_xor_si128(a, k80), bs = _mm_xor_si128(b, k80);
+    return _mm_sub_epi8(_mm_cmpgt_epi8(bs, as), _mm_cmpgt_epi8(as, bs));
+}
+
+/* v + o (signed bytes), clipped to 0..255 */
+static inline __m128i add_clip(__m128i v, __m128i o)
+{
+    const __m256i s = _mm256_add_epi16(_mm256_cvtepu8_epi16(v), _mm256_cvtepi8_epi16(o));
+    return pack_u8(s);
+}
+
+static void sao_edge_avx2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int w, int h,
+                          ptrdiff_t na, ptrdiff_t nb, const int8_t offset[5])
+{
+    int8_t tab[16] = { 0 };
+    memcpy(tab, offset, 5);
+    const __m128i lut = _mm_loadu_si128((const __m128i *)tab), two = _mm_set1_epi8(2);
+    for (int y = 0; y < h; y++) {
+        const uint8_t *c = src + y * stride;
+        uint8_t *d = dst + y * stride;
+        int x = 0;
+        for (; x + 16 <= w; x += 16) {
+            const __m128i v = _mm_loadu_si128((const __m128i *)(c + x));
+            const __m128i a = _mm_loadu_si128((const __m128i *)(c + x + na));
+            const __m128i b = _mm_loadu_si128((const __m128i *)(c + x + nb));
+            const __m128i idx = _mm_add_epi8(_mm_add_epi8(sign8(v, a), sign8(v, b)), two);
+            _mm_storeu_si128((__m128i *)(d + x), add_clip(v, _mm_shuffle_epi8(lut, idx)));
+        }
+        if (x < w)
+            svac3_dsp_c.sao_edge(d + x, c + x, stride, w - x, 1, na, nb, offset);
+    }
+}
+
+static void sao_band_avx2(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int w, int h,
+                          const int8_t band[32])
+{
+    const __m128i lo = _mm_loadu_si128((const __m128i *)band);
+    const __m128i hi = _mm_loadu_si128((const __m128i *)(band + 16));
+    const __m128i k15 = _mm_set1_epi8(15), k1f = _mm_set1_epi8(0x1f);
+    for (int y = 0; y < h; y++) {
+        const uint8_t *c = src + y * stride;
+        uint8_t *d = dst + y * stride;
+        int x = 0;
+        for (; x + 16 <= w; x += 16) {
+            const __m128i v = _mm_loadu_si128((const __m128i *)(c + x));
+            const __m128i idx = _mm_and_si128(_mm_srli_epi16(v, 3), k1f);       /* v >> 3 */
+            const __m128i i4 = _mm_and_si128(idx, k15);
+            const __m128i o = _mm_blendv_epi8(_mm_shuffle_epi8(lo, i4), _mm_shuffle_epi8(hi, i4),
+                                              _mm_cmpgt_epi8(idx, k15));
+            _mm_storeu_si128((__m128i *)(d + x), add_clip(v, o));
+        }
+        if (x < w)
+            svac3_dsp_c.sao_band(d + x, c + x, stride, w - x, 1, band);
+    }
+}
+
 const svac3_dsp_t svac3_dsp_avx2 = {
     .name = "avx2",
     .matmul = matmul_avx2,
@@ -423,4 +531,7 @@ const svac3_dsp_t svac3_dsp_avx2 = {
     .mc_v = mc_v_avx2,
     .mc_hv = mc_hv_avx2,
     .deblock = deblock_avx2,
+    .ipred_row = ipred_row_avx2,
+    .sao_edge = sao_edge_avx2,
+    .sao_band = sao_band_avx2,
 };

@@ -46,6 +46,20 @@ typedef struct {
      * chroma selects the chroma filters, type is DeblockingFilterType. */
     void (*deblock)(uint8_t *s, ptrdiff_t step, ptrdiff_t lstep, int n, int group,
                     const int *alpha, const int *beta, int chroma, int type);
+
+    /* One row of angular intra prediction: dst[x] = Clip1((ref[x] * t[0] +
+     * ref[x + 1] * t[1] + ref[x + 2] * t[2] + ref[x + 3] * t[3] + rnd) >>
+     * shift) for x < w, ref holding 8-bit samples (5.4.8.1.4.2) */
+    void (*ipred_row)(uint8_t *dst, const int16_t *ref, int w, const int8_t *t, int rnd, int shift);
+
+    /* SAO on a w x h region whose neighbours all lie in the picture, src the
+     * deblocked samples (same stride as dst). Edge mode: the class of each
+     * sample from its neighbours at src + na and src + nb, offset[class + 2]
+     * for class -2..2 (offset[2] = 0). Band mode: band[sample >> 3]. */
+    void (*sao_edge)(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int w, int h,
+                     ptrdiff_t na, ptrdiff_t nb, const int8_t offset[5]);
+    void (*sao_band)(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int w, int h,
+                     const int8_t band[32]);
 } svac3_dsp_t;
 
 /* The kernels to use on this CPU */
