@@ -14,7 +14,8 @@ says what the decoder does instead.
 
 The Main profile (0x30) tool set that HiSilicon encoders emit:
 - 8-bit 4:2:0;
-- I and P pictures, one patch per picture;
+- I and P pictures, in one patch or several (uniform patches, with the
+  loop filters crossing patch boundaries);
 - MAEC entropy coding, SRCC coefficients, EIPM (66 intra modes) and MIPF;
 - TMVP, the median motion vector predictor, and skip/direct;
 - several reference pictures, and library pictures (the library stream
@@ -24,8 +25,9 @@ The Main profile (0x30) tool set that HiSilicon encoders emit:
 Every picture of the test corpus is bit-exact against the reference
 decoder (`tests/golden/*.framemd5`).
 
-Anything else (B pictures, non-displayed library pictures, several
-patches, the security layer, the High profile's tools) is refused with
+Anything else (B pictures, non-displayed library pictures, non-uniform
+patches or loop filters stopping at patch boundaries, the security layer,
+the High profile's tools) is refused with
 `SVAC3D_ERR_UNSUPPORTED` rather than decoded wrongly.
 
 ## Build

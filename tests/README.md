@@ -8,11 +8,13 @@
 | `streams/cv608_fixqp22_1080p.svac3` | 1920x1080, first 6 of 30 frames, fixed QP 22/24 (I/P): dense coefficients | the same |
 | `streams/cv608_fixqp48_1080p.svac3` | 1920x1080, 30 frames, fixed QP 48/50: coarse, mostly skipped | the same |
 | `streams/cv608_smartp_1080p.svac3` | 1920x1080, first 45 of 60 frames, CBR 2 Mbit/s, GOP 20, SmartP with a 40-frame background interval: library pictures (NAL type 17, a library-stream SPS) every 40 frames, RL pictures (type 14) referencing them every 20, and P pictures with two references (the previous picture and the library picture) | the same |
+| `streams/cv608_patch4_1080p.svac3` | 1920x1080, 30 frames, CBR 2 Mbit/s, GOP 15, slice split every 4 LCU rows: 9 patches per picture | the same |
+| `streams/cv608_patch2_720p.svac3` | 1280x720, 20 frames, CBR 1 Mbit/s, GOP 10, split every 2 LCU rows: 12 patches per picture | the same |
 
-The first five were captured with a small program that feeds synthetic
+The cv608 streams other than the first were captured with a small program that feeds synthetic
 frames to the encoder through the SDK's video buffer pool, with the
 encoder's rate-control and GOP modes set as above. The golden hashes of all
-six come from the reference decoder. A stream cut short ("first N of M
+of them come from the reference decoder. A stream cut short ("first N of M
 frames") ends on an access-unit boundary, and its hashes are those of the
 same pictures of the whole stream.
 

@@ -5,7 +5,7 @@
  * draft of GB/T SVAC 3.0 (national standard plan 20243294-T-312).
  *
  * Supported: the Main profile (0x30) tool set HiSilicon encoders use,
- * 8-bit 4:2:0, I and P pictures, one patch per picture, and displayed
+ * 8-bit 4:2:0, I and P pictures in one or several uniform patches, and displayed
  * library pictures with the pictures that reference them. Pictures come out
  * in decoding order, which for these low-delay streams is display order.
  * Anything else is refused with SVAC3D_ERR_UNSUPPORTED.

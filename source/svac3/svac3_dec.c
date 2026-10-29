@@ -37,7 +37,18 @@ struct svac3_dec {
     int64_t cycle;
     int doi_prev, have_prev;
     int64_t last_poi;
+
+    /* the picture whose patches are being decoded */
+    svac3_picture_t *open;
+    pic_t *open_slot;
+    int open_lib;
+    int open_keep[DPB_SLOTS];
+    svac3_refs_t open_refs;
+    int64_t open_doi, open_poi;
+    uint32_t open_index;
 };
+
+static void abandon(svac3_dec_t *d);
 
 svac3_dec_t *svac3_dec_create(void)
 {
@@ -63,6 +74,7 @@ void svac3_dec_destroy(svac3_dec_t *d)
 {
     if (!d)
         return;
+    abandon(d);
     free_pics(d);
     free(d->rbsp);
     free(d);
@@ -70,6 +82,7 @@ void svac3_dec_destroy(svac3_dec_t *d)
 
 void svac3_dec_reset(svac3_dec_t *d)
 {
+    abandon(d);
     for (int i = 0; i < DPB_SLOTS; i++)
         d->pic[i].used = 0;
     for (int i = 0; i < LIB_SLOTS; i++)
@@ -172,48 +185,43 @@ static int64_t clamp_dist(int64_t dist)
     return dist < -32768 ? -32768 : dist > 32767 ? 32767 : dist;
 }
 
+static void abandon(svac3_dec_t *d)
+{
+    svac3_picture_free(d->open);
+    d->open = NULL;
+}
+
 /* A library picture (library_stream_flag 1): an I picture kept, with its
  * library_picture_index, for display pictures to reference, and output
  * since only display library patches (type 17) are accepted. A display
- * picture naming another index finds no reference. */
-static int decode_library(svac3_dec_t *d, const uint8_t *rbsp, size_t rl, int64_t doi,
-                          int64_t poi, const svac3_frame_t **out)
+ * picture naming another index finds no reference. It is decoded into
+ * the slot not holding the current library picture, which gives way only
+ * once the new one has decoded. */
+static int start_library(svac3_dec_t *d)
 {
     svac3_hls_t *hls = &d->hls;
-    const uint32_t index = hls->ph.library_picture_index;
     int ret;
 
     if (hls->ph.picture_coding_type != 1)
         return SVAC3_ERR_UNSUPPORTED;           /* inter-coded library pictures */
-
-    /* decode into the slot not holding the current library picture, which
-     * gives way only once the new one has decoded */
     pic_t *cur = d->lib[0].used ? &d->lib[1] : &d->lib[0];
     cur->used = 0;
     if (!cur->buf && (ret = alloc_pic(cur, d->w, d->h)))
         return ret;
-    ret = svac3_patch_decode(hls, rbsp, rl, &cur->f, NULL, cur->tmv, &d->st);
-    if (ret)
+    if ((ret = svac3_picture_begin(hls, &cur->f, NULL, cur->tmv, &d->open)))
         return ret;
-    for (int i = 0; i < LIB_SLOTS; i++)
-        d->lib[i].used = 0;
-    cur->used = 1;
-    cur->lib_index = index;
-    cur->doi = doi;
-    cur->poi = poi;
-    d->last_poi = poi;
-    *out = &cur->f;
+    d->open_slot = cur;
+    d->open_lib = 1;
+    d->open_index = hls->ph.library_picture_index;
     return SVAC3_OK;
 }
 
-static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
-                          const svac3_frame_t **out)
+/* Begin a picture at its first patch: DOI and POI, reference lists, a slot */
+static int start_picture(svac3_dec_t *d)
 {
     svac3_hls_t *hls = &d->hls;
     const svac3_sps_t *sps = &hls->sps;
-    int ret = svac3_patch_supported(hls);
-    if (ret)
-        return ret;
+    int ret;
 
     const int w = sps->pic_width_in_luma, h = sps->pic_height_in_luma;
     if (w != d->w || h != d->h) {
@@ -232,8 +240,10 @@ static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
     }
     const int64_t doi = doi7 + 256 * d->cycle;
     const int64_t poi = doi + hls->ph.picture_output_delay;
+    d->open_doi = doi;
+    d->open_poi = poi;
     if (sps->library_stream_flag)
-        return decode_library(d, rbsp, rl, doi, poi, out);
+        return start_library(d);
 
     /* reference lists, and the pictures either of them keeps */
     ref_t list[2][SVAC3_MAX_REFS];
@@ -246,7 +256,7 @@ static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
     }
     /* which pictures the lists keep; the buffer is pruned only once the
      * picture has decoded, so a rejected one costs no reference */
-    int keep[DPB_SLOTS];
+    int *keep = d->open_keep;
     for (int i = 0; i < DPB_SLOTS; i++) {
         const pic_t *p = &d->pic[i];
         keep[i] = 0;
@@ -255,20 +265,20 @@ static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
                 keep[i] |= p->used && !list[l][j].lib && p->doi == list[l][j].key;
     }
 
-    svac3_refs_t refs;
-    memset(&refs, 0, sizeof(refs));
+    svac3_refs_t *refs = &d->open_refs;
+    memset(refs, 0, sizeof(*refs));
     if (hls->ph.picture_coding_type == 2) {
-        refs.num = nlist[0];
+        refs->num = nlist[0];
         for (int j = 0; j < nlist[0]; j++) {
             const ref_t *e = &list[0][j];
             const pic_t *r = e->lib ? find_lib(d, e->key) : find_doi(d, e->key);
             if (!r)
                 return SVAC3_ERR_CORRUPT;       /* reference not decoded */
-            refs.ref[j] = &r->f;
+            refs->ref[j] = &r->f;
             /* a library reference's DistanceIndex is 2 * (POI - 1) (5.4.3.3) */
-            refs.dist[j] = (int)clamp_dist(e->lib ? 2 : 2 * (poi - r->poi));
+            refs->dist[j] = (int)clamp_dist(e->lib ? 2 : 2 * (poi - r->poi));
             if (j == 0)
-                refs.col = r->tmv;
+                refs->col = r->tmv;
         }
     }
 
@@ -286,18 +296,67 @@ static int decode_picture(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
     cur->used = 0;                              /* its picture is about to be overwritten */
     if (!cur->buf && (ret = alloc_pic(cur, w, h)))
         return ret;
+    if ((ret = svac3_picture_begin(hls, &cur->f, refs, cur->tmv, &d->open)))
+        return ret;
+    d->open_slot = cur;
+    d->open_lib = 0;
+    return SVAC3_OK;
+}
 
-    ret = svac3_patch_decode(hls, rbsp, rl, &cur->f, &refs, cur->tmv, &d->st);
+/* The picture's last patch has decoded: the buffer takes it */
+static void commit(svac3_dec_t *d, const svac3_frame_t **out)
+{
+    pic_t *cur = d->open_slot;
+    if (d->open_lib) {
+        for (int i = 0; i < LIB_SLOTS; i++)
+            d->lib[i].used = 0;
+        cur->lib_index = d->open_index;
+    } else {
+        for (int i = 0; i < DPB_SLOTS; i++)
+            d->pic[i].used = d->open_keep[i];
+    }
+    cur->used = 1;
+    cur->doi = d->open_doi;
+    cur->poi = d->open_poi;
+    d->last_poi = d->open_poi;
+    *out = &cur->f;
+}
+
+/* One patch NAL unit. A picture that loses patches is dropped, and the
+ * unit that shows it (the next picture's first patch, or a patch out of
+ * order) returns SVAC3_ERR_CORRUPT. */
+static int decode_patch_nal(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
+                            const svac3_frame_t **out)
+{
+    svac3_hls_t *hls = &d->hls;
+    int ret = svac3_patch_supported(hls), lost = 0;
     if (ret)
         return ret;
-    for (int i = 0; i < DPB_SLOTS; i++)
-        d->pic[i].used = keep[i];
-    cur->used = 1;
-    cur->doi = doi;
-    cur->poi = poi;
-    d->last_poi = poi;
-    *out = &cur->f;
-    return SVAC3_OK;
+
+    if (hls->patch.patch_index == 0) {
+        if (d->open) {
+            abandon(d);
+            lost = 1;
+        }
+        if ((ret = start_picture(d)))
+            return ret;
+    } else if (!d->open) {
+        return SVAC3_ERR_CORRUPT;               /* its picture's first patch was lost */
+    }
+
+    ret = svac3_picture_patch(d->open, hls, rbsp, rl, &d->st);
+    if (ret < 0) {
+        abandon(d);
+        return ret;
+    }
+    if (ret == 1) {
+        svac3_picture_t *pic = d->open;
+        d->open = NULL;
+        if ((ret = svac3_picture_end(pic, hls)))
+            return ret;
+        commit(d, out);
+    }
+    return lost ? SVAC3_ERR_CORRUPT : SVAC3_OK;
 }
 
 int svac3_dec_nal(svac3_dec_t *d, const uint8_t *nal, size_t len, const svac3_frame_t **out)
@@ -305,11 +364,19 @@ int svac3_dec_nal(svac3_dec_t *d, const uint8_t *nal, size_t len, const svac3_fr
     *out = NULL;
     if (len < 2)
         return SVAC3_ERR_INVALID;
+    /* a picture still missing patches when a header that replaces its
+     * parameters arrives is lost */
+    const unsigned t = nal[1] & 31u;
+    int lost = 0;
+    if (d->open && (t == SVAC3_NAL_SPS || t == SVAC3_NAL_PPS || t == SVAC3_NAL_PIC_HEAD)) {
+        abandon(d);
+        lost = 1;
+    }
     int ret = svac3_parse_nal(&d->hls, nal, len, 0, NULL);
     if (ret)
         return ret;
-    if (!svac3_nal_is_patch(nal[1] & 31u))
-        return SVAC3_OK;
+    if (!svac3_nal_is_patch(t))
+        return lost ? SVAC3_ERR_CORRUPT : SVAC3_OK;
     if (len - 2 > d->rbsp_cap) {
         uint8_t *b = realloc(d->rbsp, len - 2);
         if (!b)
@@ -318,5 +385,5 @@ int svac3_dec_nal(svac3_dec_t *d, const uint8_t *nal, size_t len, const svac3_fr
         d->rbsp_cap = len - 2;
     }
     const size_t rl = svac3_unescape(nal + 2, len - 2, d->rbsp);
-    return decode_picture(d, d->rbsp, rl, out);
+    return decode_patch_nal(d, d->rbsp, rl, out);
 }

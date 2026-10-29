@@ -50,6 +50,8 @@ add_test(NAME test_dec
          COMMAND test_dec ${CMAKE_SOURCE_DIR}/tests/streams/cv608_synth_1080p_cbr2m.svac3)
 add_test(NAME test_dec_library
          COMMAND test_dec -library ${CMAKE_SOURCE_DIR}/tests/streams/cv608_smartp_1080p.svac3)
+add_test(NAME test_dec_patches
+         COMMAND test_dec -patches ${CMAKE_SOURCE_DIR}/tests/streams/cv608_patch4_1080p.svac3)
 add_executable(test_api tests/test_api.c)
 target_include_directories(test_api PRIVATE source/svac3 tools)
 target_link_libraries(test_api svac3d)
