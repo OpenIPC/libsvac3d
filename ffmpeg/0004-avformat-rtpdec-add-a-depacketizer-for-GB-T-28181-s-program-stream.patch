@@ -1,0 +1,355 @@
+From e35ffb2586d6f9739272eda771be1bd75d303cf2 Mon Sep 17 00:00:00 2001
+From: Dmitry Ilyin <d.ilyin@openipc.org>
+Date: Thu, 29 Oct 2026 21:15:53 +0300
+Subject: [PATCH] avformat/rtpdec: add a depacketizer for GB/T 28181's program
+ stream
+
+GB/T 28181 carries video as an MPEG-2 program stream over RTP, announced
+as PS/90000: one RTP timestamp per picture, the marker on its last
+packet, the program stream cut into payloads at any byte. The handler
+collects a picture's payloads and reads its packs. The program stream
+map gives the video stream and its codec (SVAC 0x80, H.264, H.265,
+MPEG-4, MPEG-1/2), and the joined payloads of that stream's PES packets
+are the packet. Other streams are skipped.
+
+A picture ends at its marker, or when the next one's first packet
+arrives without one. A picture that lost a packet is dropped, and so is
+what follows until a payload opens with a pack header.
+---
+ libavformat/Makefile         |   1 +
+ libavformat/rtpdec.c         |   1 +
+ libavformat/rtpdec_formats.h |   1 +
+ libavformat/rtpdec_ps.c      | 285 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 288 insertions(+)
+ create mode 100644 libavformat/rtpdec_ps.c
+
+diff --git a/libavformat/Makefile b/libavformat/Makefile
+index a39bf11..398f4a1 100644
+--- a/libavformat/Makefile
++++ b/libavformat/Makefile
+@@ -74,6 +74,7 @@ OBJS-$(CONFIG_RTPDEC)                    += rdt.o                       \
+                                             rtpdec_opus.o               \
+                                             rtpdec_qcelp.o              \
+                                             rtpdec_qdm2.o               \
++                                            rtpdec_ps.o                 \
+                                             rtpdec_qt.o                 \
+                                             rtpdec_rfc4175.o            \
+                                             rtpdec_svac3.o              \
+diff --git a/libavformat/rtpdec.c b/libavformat/rtpdec.c
+index ab76db5..74997b0 100644
+--- a/libavformat/rtpdec.c
++++ b/libavformat/rtpdec.c
+@@ -93,6 +93,7 @@ static const RTPDynamicProtocolHandler *const rtp_dynamic_protocol_handler_list[
+     &ff_h263_rfc2190_dynamic_handler,
+     &ff_h264_dynamic_handler,
+     &ff_hevc_dynamic_handler,
++    &ff_ps_dynamic_handler,
+     &ff_svac3_dynamic_handler,
+     &ff_ilbc_dynamic_handler,
+     &ff_jpeg_dynamic_handler,
+diff --git a/libavformat/rtpdec_formats.h b/libavformat/rtpdec_formats.h
+index f882042..e8a7b7c 100644
+--- a/libavformat/rtpdec_formats.h
++++ b/libavformat/rtpdec_formats.h
+@@ -66,6 +66,7 @@ extern const RTPDynamicProtocolHandler ff_h263_2000_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_h263_rfc2190_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_h264_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_hevc_dynamic_handler;
++extern const RTPDynamicProtocolHandler ff_ps_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_svac3_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_ilbc_dynamic_handler;
+ extern const RTPDynamicProtocolHandler ff_jpeg_dynamic_handler;
+diff --git a/libavformat/rtpdec_ps.c b/libavformat/rtpdec_ps.c
+new file mode 100644
+index 0000000..ff884a9
+--- /dev/null
++++ b/libavformat/rtpdec_ps.c
+@@ -0,0 +1,285 @@
++/*
++ * RTP depacketizer for an MPEG-2 program stream (GB/T 28181)
++ *
++ * This file is part of FFmpeg.
++ *
++ * FFmpeg is free software; you can redistribute it and/or
++ * modify it under the terms of the GNU Lesser General Public
++ * License as published by the Free Software Foundation; either
++ * version 2.1 of the License, or (at your option) any later version.
++ *
++ * FFmpeg is distributed in the hope that it will be useful,
++ * but WITHOUT ANY WARRANTY; without even the implied warranty of
++ * MERCHANTABILITY or FITNESS FOR A PARTICULAR PURPOSE.  See the GNU
++ * Lesser General Public License for more details.
++ *
++ * You should have received a copy of the GNU Lesser General Public
++ * License along with FFmpeg; if not, write to the Free Software
++ * Foundation, Inc., 51 Franklin Street, Fifth Floor, Boston, MA 02110-1301 USA
++ */
++
++/*
++ * GB/T 28181 sends video as an MPEG-2 program stream over RTP, announced as
++ * a=rtpmap:<pt> PS/90000. The program stream is cut into RTP payloads at any
++ * byte: one RTP timestamp per picture, the marker on its last packet, and
++ * each picture's packs starting a payload of their own.
++ *
++ * This collects a picture's payloads, then reads its packs: the program
++ * stream map names the video stream and its stream_type (SVAC 0x80, H.264
++ * 0x1b, H.265 0x24, MPEG-4 0x10, MPEG-1/2 video 0x01/0x02), and the payloads
++ * of that stream's PES packets, joined, are the picture. Audio and any other
++ * stream in the program stream are skipped: one RTP stream is one AVStream.
++ *
++ * A picture is complete at its marker, or when a packet of the next one
++ * arrives without it. One that lost a packet is dropped, and so is what
++ * follows until a payload that starts with a pack header.
++ */
++
++#include "libavutil/intreadwrite.h"
++#include "libavutil/mem.h"
++
++#include "avformat.h"
++#include "demux.h"
++#include "internal.h"
++#include "mpeg.h"
++#include "rtpdec.h"
++#include "rtpdec_formats.h"
++
++#define PS_MAX_PICTURE (16 << 20)
++
++struct PayloadContext {
++    uint8_t *buf;            ///< the picture's RTP payloads, as received
++    int size, alloc;
++    uint32_t timestamp;      ///< its RTP timestamp, when size > 0
++    int skip;                ///< a packet was lost: wait for a pack header
++    int complete;            ///< buf holds a whole picture still to return
++    int have_seq;
++    uint16_t next_seq;
++    int video_id;            ///< stream_id of the video stream, 0 until known
++    int stream_type;         ///< its stream_type in the program stream map
++    uint8_t *out;            ///< the picture's elementary stream
++    int out_size, out_alloc;
++};
++
++static const struct {
++    int stream_type;
++    enum AVCodecID codec_id;
++} ps_video_types[] = {
++    { STREAM_TYPE_VIDEO_SVAC,  AV_CODEC_ID_SVAC3      },
++    { STREAM_TYPE_VIDEO_H264,  AV_CODEC_ID_H264       },
++    { STREAM_TYPE_VIDEO_HEVC,  AV_CODEC_ID_HEVC       },
++    { STREAM_TYPE_VIDEO_MPEG4, AV_CODEC_ID_MPEG4      },
++    { STREAM_TYPE_VIDEO_MPEG1, AV_CODEC_ID_MPEG1VIDEO },
++    { STREAM_TYPE_VIDEO_MPEG2, AV_CODEC_ID_MPEG2VIDEO },
++};
++
++static enum AVCodecID ps_video_codec(int stream_type)
++{
++    for (int i = 0; i < FF_ARRAY_ELEMS(ps_video_types); i++)
++        if (ps_video_types[i].stream_type == stream_type)
++            return ps_video_types[i].codec_id;
++    return AV_CODEC_ID_NONE;
++}
++
++static void ps_close_context(PayloadContext *data)
++{
++    av_freep(&data->buf);
++    av_freep(&data->out);
++}
++
++/* The program stream map: the first video stream it names with a type
++ * this reads becomes the stream's, and its codec the AVStream's. */
++static void ps_read_map(AVFormatContext *ctx, PayloadContext *data, AVStream *st,
++                        const uint8_t *p, int len)
++{
++    int info_len, map_len, pos;
++
++    if (len < 6)
++        return;
++    info_len = AV_RB16(p + 2);
++    if (4 + info_len + 2 > len)
++        return;
++    map_len = AV_RB16(p + 4 + info_len);
++    pos = 4 + info_len + 2;
++    if (pos + map_len > len)
++        map_len = len - pos;
++    for (int end = pos + map_len; pos + 4 <= end; ) {
++        const int type = p[pos], id = p[pos + 1];
++        const int es_info_len = AV_RB16(p + pos + 2);
++        const enum AVCodecID codec_id = ps_video_codec(type);
++
++        pos += 4 + es_info_len;
++        if (id < 0xe0 || id > 0xef || codec_id == AV_CODEC_ID_NONE)
++            continue;
++        if (data->video_id && data->video_id != id)
++            continue;                               /* another video stream */
++        if (data->stream_type == type)
++            return;
++        data->video_id    = id;
++        data->stream_type = type;
++        if (st->codecpar->codec_id != codec_id) {
++            if (st->codecpar->codec_id != AV_CODEC_ID_NONE)
++                av_log(ctx, AV_LOG_WARNING, "RTP/PS video changes codec to %s\n",
++                       avcodec_get_name(codec_id));
++            st->codecpar->codec_id = codec_id;
++            ffstream(st)->need_parsing = AVSTREAM_PARSE_FULL;
++            ffstream(st)->need_context_update = 1;
++        }
++        return;
++    }
++}
++
++static int ps_append(PayloadContext *data, const uint8_t *p, int len)
++{
++    if (data->out_size + len > data->out_alloc) {
++        int ret = av_reallocp(&data->out, data->out_size + len);
++        if (ret < 0)
++            return ret;
++        data->out_alloc = data->out_size + len;
++    }
++    memcpy(data->out + data->out_size, p, len);
++    data->out_size += len;
++    return 0;
++}
++
++/* The video stream's bytes in a picture's packs, into data->out */
++static int ps_read_packs(AVFormatContext *ctx, PayloadContext *data, AVStream *st,
++                         const uint8_t *p, int len)
++{
++    int pos = 0, ret;
++
++    data->out_size = 0;
++    while (pos + 4 <= len) {
++        int code, body;
++
++        if (AV_RB24(p + pos) != 1) {                /* resynchronise */
++            pos++;
++            continue;
++        }
++        code = p[pos + 3];
++        if (code == 0xba) {                         /* pack header */
++            if (pos + 14 > len)
++                break;
++            if ((p[pos + 4] & 0xc0) == 0x40)        /* MPEG-2, with stuffing */
++                pos += 14 + (p[pos + 13] & 7);
++            else                                    /* MPEG-1 */
++                pos += 12;
++            continue;
++        }
++        if (code == 0xb9) {                         /* program end */
++            pos += 4;
++            continue;
++        }
++        if (code < 0xbb || pos + 6 > len) {
++            pos += 4;
++            continue;
++        }
++        body = AV_RB16(p + pos + 4);
++        pos += 6;
++        if (body > len - pos)
++            body = len - pos;                       /* cut short: take what is there */
++        if (code == 0xbc) {
++            ps_read_map(ctx, data, st, p + pos, body);
++        } else if (code == data->video_id && body >= 3 && (p[pos] & 0xc0) == 0x80) {
++            const int hdr = 3 + p[pos + 2];         /* MPEG-2 PES header */
++            if (hdr < body && (ret = ps_append(data, p + pos + hdr, body - hdr)) < 0)
++                return ret;
++        }
++        pos += body;
++    }
++    return data->out_size;
++}
++
++/* The collected picture as pkt, with its timestamp */
++static int ps_emit(AVFormatContext *ctx, PayloadContext *data, AVStream *st,
++                   AVPacket *pkt, uint32_t *timestamp)
++{
++    int ret = ps_read_packs(ctx, data, st, data->buf, data->size);
++
++    data->size = 0;
++    if (ret <= 0)
++        return ret < 0 ? ret : AVERROR(EAGAIN);
++    if (st->codecpar->codec_id == AV_CODEC_ID_NONE)
++        return AVERROR(EAGAIN);                     /* no program stream map yet */
++    if ((ret = av_new_packet(pkt, data->out_size)) < 0)
++        return ret;
++    memcpy(pkt->data, data->out, data->out_size);
++    pkt->stream_index = st->index;
++    *timestamp = data->timestamp;
++    return 0;
++}
++
++static int ps_handle_packet(AVFormatContext *ctx, PayloadContext *data,
++                            AVStream *st, AVPacket *pkt, uint32_t *timestamp,
++                            const uint8_t *buf, int len, uint16_t seq,
++                            int flags)
++{
++    uint32_t ts;
++    int pack_start, ret = AVERROR(EAGAIN);
++
++    if (!buf) {                 /* the second of two pictures one packet completed */
++        if (!data->complete)
++            return AVERROR(EAGAIN);
++        data->complete = 0;
++        return ps_emit(ctx, data, st, pkt, timestamp);
++    }
++    ts = *timestamp;
++    pack_start = len >= 4 && AV_RB32(buf) == 0x1ba;
++    if (data->have_seq && seq != data->next_seq) {
++        av_log(ctx, AV_LOG_WARNING, "RTP/PS: %d packet(s) lost, dropping the picture\n",
++               (uint16_t)(seq - data->next_seq));
++        data->size = 0;
++        data->skip = 1;
++    }
++    data->have_seq = 1;
++    data->next_seq = seq + 1;
++
++    /* the next picture began without the last one's marker: that one is
++     * complete, and this packet starts the next */
++    if (data->size && ts != data->timestamp) {
++        ret = ps_emit(ctx, data, st, pkt, timestamp);
++        if (ret < 0 && ret != AVERROR(EAGAIN))
++            return ret;
++    }
++    if (data->skip && pack_start)
++        data->skip = 0;
++    if (data->skip)
++        return ret;
++
++    if (!data->size)
++        data->timestamp = ts;
++    if (data->size + len > PS_MAX_PICTURE) {
++        av_log(ctx, AV_LOG_ERROR, "RTP/PS picture over %d bytes, dropped\n", PS_MAX_PICTURE);
++        data->size = 0;
++        data->skip = 1;
++        return ret;
++    }
++    if (data->size + len > data->alloc) {
++        const int alloc = data->size + len + (data->size + len) / 2;
++        int err = av_reallocp(&data->buf, alloc);
++        if (err < 0) {
++            data->size = data->alloc = 0;
++            return err;
++        }
++        data->alloc = alloc;
++    }
++    memcpy(data->buf + data->size, buf, len);
++    data->size += len;
++
++    if (!(flags & RTP_FLAG_MARKER))
++        return ret;
++    if (ret == 0) {             /* already returning the last picture */
++        data->complete = 1;
++        return 1;
++    }
++    return ps_emit(ctx, data, st, pkt, timestamp);
++}
++
++const RTPDynamicProtocolHandler ff_ps_dynamic_handler = {
++    .enc_name         = "PS",
++    .codec_type       = AVMEDIA_TYPE_VIDEO,
++    .codec_id         = AV_CODEC_ID_NONE,
++    .priv_data_size   = sizeof(PayloadContext),
++    .close            = ps_close_context,
++    .parse_packet     = ps_handle_packet,
++};
+-- 
+2.54.0
+

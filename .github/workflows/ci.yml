@@ -135,5 +135,11 @@ jobs:
           # sprop-sps and sprop-pps on fmtp lines of their own, and no
           # parameter set in band: the SDP is all the decoder gets.
           ffmpeg/rtp_check.sh ffbuild/ffmpeg 1200 split
+      - name: framemd5 from a program stream over RTP (PS/90000) equals the golden hashes
+        run: |
+          ffmpeg/rtp_check.sh ffbuild/ffmpeg 1200 ps
+          ffmpeg/rtp_check.sh ffbuild/ffmpeg 300 ps
+          # No marker bits: only the next picture's timestamp ends one.
+          ffmpeg/rtp_check.sh ffbuild/ffmpeg 1200 ps-nomarker
       - name: framemd5 from a GB/T 28181 program stream equals the golden hashes
         run: ffmpeg/ps_check.sh ffbuild/ffmpeg

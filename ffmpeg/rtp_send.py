@@ -6,11 +6,15 @@ top): single NAL unit packets, and fragmentation units of type 28 with an
 S|E|R|FuType header. One access unit per RTP timestamp, the marker on its
 last packet.
 
-usage: rtp_send.py stream.svac3 out.sdp port [mtu [split]]
+usage: rtp_send.py stream.svac3 out.sdp port [mtu [split|ps|ps-nomarker]]
 "split" puts sprop-sps and sprop-pps on fmtp lines of their own and leaves
 them out of the first access unit, so the first picture decodes only from
 what the SDP gave. Later units keep theirs: a stream with library pictures
 re-sends its SPS between the library and the pictures that use it.
+"ps" sends GB/T 28181's program stream instead (PS/90000): each access unit
+as ps_write.py packs it, cut into payloads of mtu bytes, the marker on the
+last. "ps-nomarker" leaves the marker off, so only the next picture's RTP
+timestamp ends a picture.
 Writes the SDP, then waits for a line on stdin (the receiver is up), then
 sends, paced so a local receiver does not drop.
 """
@@ -81,9 +85,12 @@ def payloads(nal, mtu):
 def main():
     path, sdp_path, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
     mtu = int(sys.argv[4]) if len(sys.argv) > 4 else 1200
-    split = len(sys.argv) > 5 and sys.argv[5] == "split"
+    mode = sys.argv[5] if len(sys.argv) > 5 else ""
+    split = mode == "split"
     data = open(path, "rb").read()
     aus = list(access_units(nal_units(data)))
+    if mode.startswith("ps"):
+        return send_ps(aus, sdp_path, port, mtu, mode == "ps")
     sps = next(n for au in aus for n in au if n[1] & 0x1F == 7)
     pps = next(n for au in aus for n in au if n[1] & 0x1F == 8)
     sprop_sps = f"sprop-sps={base64.b64encode(sps).decode()}"
@@ -118,6 +125,43 @@ def main():
                 time.sleep(0.001)
         time.sleep(0.004)
     print(f"sent {len(aus)} access units", file=sys.stderr)
+
+
+def send_ps(aus, sdp_path, port, mtu, marker):
+    from ps_write import pack
+    pt = 96
+    with open(sdp_path, "w") as f:
+        f.write(
+            "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=ps\r\n"
+            "c=IN IP4 127.0.0.1\r\nt=0 0\r\n"
+            f"m=video {port} RTP/AVP {pt}\r\n"
+            f"a=rtpmap:{pt} PS/90000\r\n")
+    sys.stdout.write("sdp\n")
+    sys.stdout.flush()
+    sys.stdin.readline()
+
+    s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
+    s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 22)
+    seq, ssrc = 0, 0x5AC4
+    for n, au in enumerate(aus):
+        ts = (n * 3000) & 0xFFFFFFFF
+        ps = pack(au, n)
+        pkts = [ps[off:off + mtu] for off in range(0, len(ps), mtu)]
+        for i, p in enumerate(pkts):
+            m = 0x80 if marker and i == len(pkts) - 1 else 0
+            hdr = bytes([0x80, m | pt]) + seq.to_bytes(2, "big") + \
+                ts.to_bytes(4, "big") + ssrc.to_bytes(4, "big")
+            s.sendto(hdr + p, ("127.0.0.1", port))
+            seq = (seq + 1) & 0xFFFF
+            if i % 4 == 3:
+                time.sleep(0.001)
+        time.sleep(0.004)
+    if not marker:
+        # the last picture ends only when another timestamp arrives
+        hdr = bytes([0x80, pt]) + seq.to_bytes(2, "big") + \
+            (len(aus) * 3000 & 0xFFFFFFFF).to_bytes(4, "big") + ssrc.to_bytes(4, "big")
+        s.sendto(hdr + bytes([0, 0, 1, 0xBA]), ("127.0.0.1", port))
+    print(f"sent {len(aus)} access units as a program stream", file=sys.stderr)
 
 
 if __name__ == "__main__":
