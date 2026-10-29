@@ -11,7 +11,9 @@
 #include <string.h>
 
 #define BIT_DEPTH 8
-#define MAX_REF   (2 * 64 + 4)
+/* reference samples kept per side: 2 * 64 for the block, padded to what the
+ * steepest angular mode reaches from a 64-sample block (176 + 64 + 3) */
+#define MAX_REF   (4 * 64 + 16)
 
 static inline int clip3(int lo, int hi, int v) { return v < lo ? lo : v > hi ? hi : v; }
 static inline int clip1(int v) { return clip3(0, (1 << BIT_DEPTH) - 1, v); }
@@ -29,7 +31,7 @@ static int ilog2(int v)
  * left; both are stored with an offset of 2 so r[-2] and r[-1] exist. */
 
 typedef struct {
-    int r[MAX_REF + 2], c[MAX_REF + 2];
+    int16_t r[MAX_REF + 2], c[MAX_REF + 2];
     int any_r, any_c;            /* some r[1..M] / c[1..N] available */
     int M, N;
 } refs_t;
@@ -182,6 +184,41 @@ static void pred_angular(refs_t *t, int mode, int chroma, int mipf, uint8_t *p)
     R(t, -2) = C(t, 2);
     C(t, -1) = R(t, 1);
     C(t, -2) = R(t, 2);
+
+    if (xySign < 0) {
+        /* each row (xyAxis 0) or column (1) is one fractional position along
+         * one reference line: a 4-tap filter over it. Past 2M (2N) the line
+         * repeats its last sample, as rr() and cc() read it. */
+        const svac3_dsp_t *dsp = svac3_dsp();
+        if (xyAxis == 0) {
+            const int last = (M - 1) + ((N * imx) >> isx) + 3;
+            for (int i = 2 * M + 1; i <= last; i++)
+                R(t, i) = R(t, 2 * M);
+            for (int y = 0; y < N; y++) {
+                const int dy = ((y + 1) * imx) >> isx;
+                const int offset = (((y + 1) * imx * 32) >> isx) - dy * 32;
+                const int fi = (chroma ? y <= 1 : y == 0) ? edge_f : in_f;
+                dsp->ipred_row(p + y * M, &R(t, dy), M, svac3_ipf_tab[fi][offset],
+                               filterOffset[fi], filterBit[fi]);
+            }
+        } else {
+            uint8_t col[64 * 64];
+            const int last = (N - 1) + ((M * imy) >> isy) + 3;
+            for (int j = 2 * N + 1; j <= last; j++)
+                C(t, j) = C(t, 2 * N);
+            for (int x = 0; x < M; x++) {
+                const int dx = ((x + 1) * imy) >> isy;
+                const int offset = (((x + 1) * imy * 32) >> isy) - dx * 32;
+                const int fi = (chroma ? x <= 1 : x == 0) ? edge_f : in_f;
+                dsp->ipred_row(col + x * N, &C(t, dx), N, svac3_ipf_tab[fi][offset],
+                               filterOffset[fi], filterBit[fi]);
+            }
+            for (int y = 0; y < N; y++)
+                for (int x = 0; x < M; x++)
+                    p[y * M + x] = col[x * N + y];
+        }
+        return;
+    }
 
     for (int y = 0; y < N; y++)
         for (int x = 0; x < M; x++) {

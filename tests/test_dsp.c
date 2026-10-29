@@ -11,6 +11,7 @@
 #include <string.h>
 
 #include "svac3_dsp.h"
+#include "svac3_tables.h"
 
 static int failures;
 static uint32_t seed = 12345;
@@ -147,6 +148,57 @@ static void test_deblock(const svac3_dsp_t *s)
              chroma ? "chroma" : "luma", n, type);
 }
 
+static void test_ipred(const svac3_dsp_t *s)
+{
+    static int16_t ref[64 + 8];
+    static uint8_t d1[64 + 8], d2[64 + 8];
+    static const int widths[] = { 2, 4, 8, 12, 16, 32, 64 };
+    static const int bits[4] = { 7, 7, 7, 6 };
+    const int w = widths[range(0, 6)], fi = range(0, 3), off = range(0, 31);
+    for (int i = 0; i < w + 3; i++)
+        ref[i] = (int16_t)(range(0, 3) ? range(0, 255) : (rnd() & 1) * 255);
+    memset(d1, 0x55, sizeof(d1));
+    memset(d2, 0x55, sizeof(d2));
+    svac3_dsp_c.ipred_row(d1, ref, w, svac3_ipf_tab[fi][off], 1 << (bits[fi] - 1), bits[fi]);
+    s->ipred_row(d2, ref, w, svac3_ipf_tab[fi][off], 1 << (bits[fi] - 1), bits[fi]);
+    if (memcmp(d1, d2, sizeof(d1)))
+        FAIL("ipred_row w=%d filter %d offset %d differs\n", w, fi, off);
+}
+
+static void test_sao(const svac3_dsp_t *s)
+{
+    enum { S = 80, ROWS = 40 };
+    static uint8_t src[S * ROWS], d1[S * ROWS], d2[S * ROWS];
+    const int smooth = (int)(rnd() & 1);
+    for (int i = 0; i < S * ROWS; i++)
+        src[i] = (uint8_t)(smooth ? 100 + range(0, 2) : rnd());
+    memcpy(d1, src, sizeof(src));
+    memcpy(d2, src, sizeof(src));
+    const int w = range(1, 70), h = range(1, 30);
+    const ptrdiff_t at = 2 * S + 2;
+    if (rnd() & 1) {
+        static const int dx[4][2] = { { -1, 1 }, { 0, 0 }, { -1, 1 }, { 1, -1 } };
+        static const int dy[4][2] = { { 0, 0 }, { -1, 1 }, { -1, 1 }, { -1, 1 } };
+        const int t = range(0, 3);
+        int8_t o[5];
+        for (int k = 0; k < 5; k++)
+            o[k] = (int8_t)(k == 2 ? 0 : range(-7, 7));
+        const ptrdiff_t na = dy[t][0] * S + dx[t][0], nb = dy[t][1] * S + dx[t][1];
+        svac3_dsp_c.sao_edge(d1 + at, src + at, S, w, h, na, nb, o);
+        s->sao_edge(d2 + at, src + at, S, w, h, na, nb, o);
+        if (memcmp(d1, d2, sizeof(d1)))
+            FAIL("sao_edge type %d %dx%d differs\n", t, w, h);
+    } else {
+        int8_t band[32];
+        for (int k = 0; k < 32; k++)
+            band[k] = (int8_t)range(-7, 7);
+        svac3_dsp_c.sao_band(d1 + at, src + at, S, w, h, band);
+        s->sao_band(d2 + at, src + at, S, w, h, band);
+        if (memcmp(d1, d2, sizeof(d1)))
+            FAIL("sao_band %dx%d differs\n", w, h);
+    }
+}
+
 int main(int argc, char **argv)
 {
     const int iters = argc > 1 ? atoi(argv[1]) : 20000;
@@ -160,10 +212,12 @@ int main(int argc, char **argv)
         test_add_block(s);
         test_mc(s);
         test_deblock(s);
+        test_ipred(s);
+        test_sao(s);
     }
     if (failures)
         fprintf(stderr, "%s: %d mismatch(es)\n", s->name, failures);
     else
-        printf("%s: %d x 4 kernel groups agree with C\n", s->name, iters);
+        printf("%s: %d x 6 kernel groups agree with C\n", s->name, iters);
     return failures ? 1 : 0;
 }

@@ -171,6 +171,36 @@ static void deblock_c(uint8_t *s, ptrdiff_t step, ptrdiff_t lstep, int n, int gr
             deblock_line(s + l * lstep, step, alpha[l / group], beta[l / group], chroma, type);
 }
 
+static void ipred_row_c(uint8_t *dst, const int16_t *ref, int w, const int8_t *t, int rnd, int shift)
+{
+    for (int x = 0; x < w; x++)
+        dst[x] = (uint8_t)clip1((ref[x] * t[0] + ref[x + 1] * t[1] + ref[x + 2] * t[2] +
+                                 ref[x + 3] * t[3] + rnd) >> shift);
+}
+
+static inline int sign(int v) { return (v > 0) - (v < 0); }
+
+static void sao_edge_c(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int w, int h,
+                       ptrdiff_t na, ptrdiff_t nb, const int8_t offset[5])
+{
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            const uint8_t *c = src + y * stride + x;
+            const int cls = sign(c[0] - c[na]) + sign(c[0] - c[nb]);
+            dst[y * stride + x] = (uint8_t)clip1(c[0] + offset[cls + 2]);
+        }
+}
+
+static void sao_band_c(uint8_t *dst, const uint8_t *src, ptrdiff_t stride, int w, int h,
+                       const int8_t band[32])
+{
+    for (int y = 0; y < h; y++)
+        for (int x = 0; x < w; x++) {
+            const int v = src[y * stride + x];
+            dst[y * stride + x] = (uint8_t)clip1(v + band[v >> 3]);
+        }
+}
+
 const svac3_dsp_t svac3_dsp_c = {
     .name = "c",
     .matmul = matmul_c,
@@ -179,6 +209,9 @@ const svac3_dsp_t svac3_dsp_c = {
     .mc_v = mc_v_c,
     .mc_hv = mc_hv_c,
     .deblock = deblock_c,
+    .ipred_row = ipred_row_c,
+    .sao_edge = sao_edge_c,
+    .sao_band = sao_band_c,
 };
 
 #if defined(SVAC3_HAVE_AVX2)
