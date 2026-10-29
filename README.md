@@ -52,10 +52,25 @@ decoded pictures. On the 1080p CBR corpus stream, one core decodes about
 200 pictures a second on a Cortex-X925 and about 110 on a Core i9-13900;
 at high bit rates the entropy decoder, which is serial, sets the pace.
 
-`svac3d_set_threads()` (`svac3dec -t N`, FFmpeg's `-threads`) decodes on
-several threads: one parses while another reconstructs, and the loop
-filters run in bands on all of them. Pictures and their order are the same
-whatever the number; on 2 threads a picture takes about 0.65 of the time.
+`svac3d_set_threads()` (`svac3dec -t N`, FFmpeg's `-threads`) decodes N
+pictures at a time. A P picture waits only for the rows of its reference
+that its motion reaches, as the reference's thread finishes them, and
+each picture has its reconstruction and loop filters follow its parser on
+two threads of its own, so up to three threads per picture are busy.
+Pictures come out in the same order and with the same bits whatever the
+number, up to N pictures later than with one thread; `svac3d_flush()`
+returns the last of them at the end of the stream.
+
+On a Core Ultra 5 245K (six P-cores):
+
+| stream | 1 thread | 2 threads | 4 threads |
+|---|---|---|---|
+| 1080p CBR, 90 pictures | 0.45 s | 0.13 s | 0.13 s |
+| 2560x1440, 295 pictures | 3.25 s | 0.89 s | 0.79 s |
+| 1080p QP 22, 120 pictures, an I picture in six | 1.58 s | 0.76 s | 0.68 s |
+
+Threads cost 10-30% more CPU time than one thread does. Streams with many I
+pictures gain least: nothing overlaps an I picture's entropy decoding.
 
 ## API
 
@@ -65,10 +80,14 @@ whatever the number; on 2 threads a picture takes about 0.65 of the time.
 svac3d_t *d = svac3d_open();
 svac3d_set_threads(d, 4);                         /* optional */
 svac3d_decode(d, buf, len, on_picture, opaque);   /* Annex-B, any whole NAL units */
+svac3d_flush(d, on_picture, opaque);              /* at the end, with threads */
 svac3d_close(d);
 ```
 
 `on_picture` receives each decoded picture, cropped to the display size.
+`svac3d_decode_tag()` gives each picture a value from the buffer its first
+patch came in, which is how the FFmpeg wrapper keeps packet timestamps on
+pictures that come out later.
 
 ## FFmpeg
 

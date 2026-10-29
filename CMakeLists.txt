@@ -59,6 +59,8 @@ add_test(NAME test_api
          COMMAND test_api ${CMAKE_SOURCE_DIR}/tests/streams/cv608_synth_1080p_cbr2m.svac3)
 add_test(NAME test_api_lost_patch
          COMMAND test_api -lost ${CMAKE_SOURCE_DIR}/tests/streams/cv608_patch4_1080p.svac3)
+add_test(NAME test_api_lost_library
+         COMMAND test_api -lost ${CMAKE_SOURCE_DIR}/tests/streams/cv608_smartp_1080p.svac3)
 add_executable(test_dsp tests/test_dsp.c)
 target_include_directories(test_dsp PRIVATE source/svac3)
 target_link_libraries(test_dsp svac3d)
