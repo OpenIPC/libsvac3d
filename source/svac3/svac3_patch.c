@@ -1356,6 +1356,10 @@ static int decode_patch(parser_t *p, const svac3_hls_t *hls, const uint8_t *data
     p->fixed_qp = hls->pps.fixed_picture_qp_flag ? 1 : hls->patch.fixed_patch_qp_flag;
     p->patch_qp = hls->pps.fixed_picture_qp_flag ? hls->ph.picture_qp : hls->patch.patch_qp;
     p->prev_cu_qp = p->lcu_qp = p->patch_qp;
+    /* a QP group does not continue into the next patch */
+    p->num_delta_qp = 0;
+    p->qp_group_x = p->plx0 * p->lcu_size;
+    p->qp_group_y = p->ply0 * p->lcu_size;
     svac3_ctx_init(p->ctx, SVAC3_NUM_CTX);
     svac3_aec_init(&p->aec, data + hls->patch.aec_data_offset,
                    len - hls->patch.aec_data_offset, s->maec_enable_flag, p->pct);

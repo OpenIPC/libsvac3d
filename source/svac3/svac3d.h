@@ -68,9 +68,11 @@ void svac3d_reset(svac3d_t *d);
 
 /* Decode an Annex-B buffer (start codes, then NAL units) holding any whole
  * number of NAL units, typically one access unit. out is called once for
- * each picture completed, before the call returns. Decoding stops at the
- * first NAL unit in error, whose code is returned; the decoder stays usable
- * and later buffers decode normally once their references exist. */
+ * each picture completed, before the call returns. A NAL unit in error
+ * does not stop the others: the first error is returned once the whole
+ * buffer is decoded, and every picture that did complete has been given
+ * to out. The decoder stays usable; pictures referencing a lost one are
+ * refused until the next I picture. */
 int svac3d_decode(svac3d_t *d, const uint8_t *buf, size_t len, svac3d_output_fn out,
                   void *opaque);
 
