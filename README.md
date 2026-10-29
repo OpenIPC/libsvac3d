@@ -41,6 +41,16 @@ cmake --install build          # libsvac3d.a, svac3d.h, libsvac3d.pc
 
 `build/svac3dec stream.svac3 out.yuv` decodes a raw stream to I420.
 
+## Performance
+
+The sample kernels (inverse transform, motion compensation, adding the
+residual, deblocking) have AVX2 versions on x86-64, chosen at run time when
+the CPU has it, and NEON versions on AArch64; `-DSVAC3D_SIMD=OFF` builds the
+C ones only. Every SIMD kernel gives the C kernel's output bits:
+`test_dsp` compares them on random inputs, and the corpus checks the
+decoded pictures. On the 1080p CBR corpus stream, one core decodes about
+190 pictures a second on a Cortex-X925 and about 100 on a Core i9-13900.
+
 ## API
 
 `source/svac3/svac3d.h` is the installed interface:

@@ -5,6 +5,9 @@
  * 5.4.9.2.7.2.
  */
 #include "svac3_inter.h"
+#include "svac3_dsp.h"
+
+#include <string.h>
 
 static inline int clip3(int lo, int hi, int v) { return v < lo ? lo : v > hi ? hi : v; }
 static inline int clip1(int v) { return clip3(0, 255, v); }
@@ -84,13 +87,40 @@ static void interp(const svac3_frame_t *ref, int c, int ix, int iy, int fx, int 
     }
 }
 
+/* With every sample the taps reach inside the plane, the kernels need no
+ * clamping; otherwise the generic path above clamps each one. */
+static void predict(const svac3_frame_t *ref, int c, int ix, int iy, int fx, int fy,
+                    int w, int h, const int8_t *th, const int8_t *tv, int ntap,
+                    uint8_t *pred)
+{
+    const int lead = ntap / 2 - 1;
+    if (ix - lead < 0 || iy - lead < 0 || ix + w + ntap / 2 > ref->width[c] ||
+        iy + h + ntap / 2 > ref->height[c] || w > 64 || h > 64) {
+        interp(ref, c, ix, iy, fx, fy, w, h, th, tv, ntap, lead, pred);
+        return;
+    }
+    const svac3_dsp_t *dsp = svac3_dsp();
+    const int stride = ref->stride[c];
+    const uint8_t *src = ref->plane[c] + (size_t)iy * stride + ix;
+    if (!fx && !fy) {
+        for (int y = 0; y < h; y++)
+            memcpy(pred + y * w, src + (size_t)y * stride, (size_t)w);
+    } else if (!fy) {
+        dsp->mc_h(pred, src, stride, w, h, th, ntap);
+    } else if (!fx) {
+        dsp->mc_v(pred, src, stride, w, h, tv, ntap);
+    } else {
+        dsp->mc_hv(pred, src, stride, w, h, th, tv, ntap);
+    }
+}
+
 void svac3_mc_luma(const svac3_frame_t *ref, int x0, int y0, int w, int h,
                    int mvx, int mvy, uint8_t *pred)
 {
     const int xp = (x0 << 2) + mvx, yp = (y0 << 2) + mvy;
     /* arithmetic shift of a possibly negative position: floor division */
     const int ix = xp >> 2, iy = yp >> 2, fx = xp & 3, fy = yp & 3;
-    interp(ref, 0, ix, iy, fx, fy, w, h, luma_tap[fx], luma_tap[fy], 8, 3, pred);
+    predict(ref, 0, ix, iy, fx, fy, w, h, luma_tap[fx], luma_tap[fy], 8, pred);
 }
 
 void svac3_mc_chroma(const svac3_frame_t *ref, int c, int cx0, int cy0, int w, int h,
@@ -99,5 +129,5 @@ void svac3_mc_chroma(const svac3_frame_t *ref, int c, int cx0, int cy0, int w, i
     /* (xE + 2x) << 2 + mv in luma quarter samples is chroma eighth samples */
     const int xp = ((cx0 * 2) << 2) + mvx, yp = ((cy0 * 2) << 2) + mvy;
     const int ix = xp >> 3, iy = yp >> 3, fx = xp & 7, fy = yp & 7;
-    interp(ref, c, ix, iy, fx, fy, w, h, chroma_tap[fx], chroma_tap[fy], 4, 1, pred);
+    predict(ref, c, ix, iy, fx, fy, w, h, chroma_tap[fx], chroma_tap[fy], 4, pred);
 }
