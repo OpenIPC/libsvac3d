@@ -1,4 +1,4 @@
-From 99fec2b8b5064bc35a21a020fac5b407e4dcbc5f Mon Sep 17 00:00:00 2001
+From 1f53eb76dfc19c220a84622c192074ab056d6db7 Mon Sep 17 00:00:00 2001
 From: Dmitry Ilyin <d.ilyin@openipc.org>
 Date: Thu, 29 Oct 2026 16:25:19 +0300
 Subject: [PATCH] avformat/rtpdec: add an RTP depacketizer for SVAC 3.0
@@ -11,8 +11,8 @@ with sprop-sps/sprop-pps in the fmtp.
  libavformat/Makefile         |   1 +
  libavformat/rtpdec.c         |   1 +
  libavformat/rtpdec_formats.h |   1 +
- libavformat/rtpdec_svac3.c   | 168 +++++++++++++++++++++++++++++++++++
- 4 files changed, 171 insertions(+)
+ libavformat/rtpdec_svac3.c   | 170 +++++++++++++++++++++++++++++++++++
+ 4 files changed, 173 insertions(+)
  create mode 100644 libavformat/rtpdec_svac3.c
 
 diff --git a/libavformat/Makefile b/libavformat/Makefile
@@ -53,10 +53,10 @@ index 1ff2a72..f882042 100644
  extern const RTPDynamicProtocolHandler ff_mp4a_latm_dynamic_handler;
 diff --git a/libavformat/rtpdec_svac3.c b/libavformat/rtpdec_svac3.c
 new file mode 100644
-index 0000000..a50bd22
+index 0000000..b624779
 --- /dev/null
 +++ b/libavformat/rtpdec_svac3.c
-@@ -0,0 +1,168 @@
+@@ -0,0 +1,170 @@
 +/*
 + * RTP depacketizer for SVAC 3.0 video
 + *
@@ -149,14 +149,16 @@ index 0000000..a50bd22
 +    if (ret < 0 || !(data->sps_size + data->pps_size))
 +        return ret;
 +
-+    /* Annex-B, as the decoder reads its extradata. */
++    /* Annex-B, SPS before PPS, as the decoder reads its extradata. Rebuilt
++     * from both sets on every fmtp line and the sets kept until close, so a
++     * sender that puts sprop-sps and sprop-pps on lines of their own still
++     * gives the decoder both. */
++    av_freep(&par->extradata);
++    par->extradata_size = 0;
 +    if ((ret = ff_alloc_extradata(par, data->sps_size + data->pps_size)) >= 0) {
 +        memcpy(par->extradata, data->sps, data->sps_size);
 +        memcpy(par->extradata + data->sps_size, data->pps, data->pps_size);
 +    }
-+    av_freep(&data->sps);
-+    av_freep(&data->pps);
-+    data->sps_size = data->pps_size = 0;
 +    return ret;
 +}
 +

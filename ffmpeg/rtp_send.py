@@ -6,7 +6,11 @@ top): single NAL unit packets, and fragmentation units of type 28 with an
 S|E|R|FuType header. One access unit per RTP timestamp, the marker on its
 last packet.
 
-usage: rtp_send.py stream.svac3 out.sdp port [mtu]
+usage: rtp_send.py stream.svac3 out.sdp port [mtu [split]]
+"split" puts sprop-sps and sprop-pps on fmtp lines of their own and leaves
+them out of the first access unit, so the first picture decodes only from
+what the SDP gave. Later units keep theirs: a stream with library pictures
+re-sends its SPS between the library and the pictures that use it.
 Writes the SDP, then waits for a line on stdin (the receiver is up), then
 sends, paced so a local receiver does not drop.
 """
@@ -38,18 +42,24 @@ def nal_units(data):
             yield nal
 
 
+PATCHES = {1, 2, 4, 12, 14, 17, 18, 19}
+# What opens an access unit once its patches have been seen: the rule of
+# ff_svac3_nal_starts_au() in 0001's parser.
+STARTERS = {3, 5, 6, 7, 8, 9}
+
+
 def access_units(nals):
-    """Group into access units: a new one starts at an SPS (or SEC_PS) or at
-    a picture header that does not follow a PPS."""
-    au, prev = [], None
+    """Group NAL units into access units the way the FFmpeg parser does: a
+    picture header, extension, SEI, SPS, PPS or security parameter set that
+    follows a patch opens the next one."""
+    au, patch_seen = [], False
     for nal in nals:
         t = nal[1] & 0x1F
-        starts = t in (7, 9) or (t == 3 and prev not in (7, 8, 9))
-        if starts and au and prev not in (9,):
+        if patch_seen and t in STARTERS:
             yield au
-            au = []
+            au, patch_seen = [], False
         au.append(nal)
-        prev = t
+        patch_seen = patch_seen or t in PATCHES
     if au:
         yield au
 
@@ -71,18 +81,21 @@ def payloads(nal, mtu):
 def main():
     path, sdp_path, port = sys.argv[1], sys.argv[2], int(sys.argv[3])
     mtu = int(sys.argv[4]) if len(sys.argv) > 4 else 1200
+    split = len(sys.argv) > 5 and sys.argv[5] == "split"
     data = open(path, "rb").read()
     aus = list(access_units(nal_units(data)))
     sps = next(n for au in aus for n in au if n[1] & 0x1F == 7)
     pps = next(n for au in aus for n in au if n[1] & 0x1F == 8)
+    sprop_sps = f"sprop-sps={base64.b64encode(sps).decode()}"
+    sprop_pps = f"sprop-pps={base64.b64encode(pps).decode()}"
+    fmtp = (f"a=fmtp:{PT} {sprop_sps}\r\na=fmtp:{PT} {sprop_pps}\r\n" if split
+            else f"a=fmtp:{PT} {sprop_sps};{sprop_pps}\r\n")
     with open(sdp_path, "w") as f:
         f.write(
             "v=0\r\no=- 0 0 IN IP4 127.0.0.1\r\ns=svac3\r\n"
             "c=IN IP4 127.0.0.1\r\nt=0 0\r\n"
             f"m=video {port} RTP/AVP {PT}\r\n"
-            f"a=rtpmap:{PT} SVAC3/90000\r\n"
-            f"a=fmtp:{PT} sprop-sps={base64.b64encode(sps).decode()};"
-            f"sprop-pps={base64.b64encode(pps).decode()}\r\n")
+            f"a=rtpmap:{PT} SVAC3/90000\r\n" + fmtp)
     sys.stdout.write("sdp\n")
     sys.stdout.flush()
     sys.stdin.readline()
@@ -90,6 +103,8 @@ def main():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
     s.setsockopt(socket.SOL_SOCKET, socket.SO_SNDBUF, 1 << 22)
     seq, ssrc = 0, 0x5AC3
+    if split:
+        aus[0] = [nal for nal in aus[0] if nal[1] & 0x1F not in (7, 8)]
     for n, au in enumerate(aus):
         ts = (n * 3000) & 0xFFFFFFFF
         pkts = [p for nal in au for p in payloads(nal, mtu)]

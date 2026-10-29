@@ -132,3 +132,6 @@ jobs:
           ffmpeg/rtp_check.sh ffbuild/ffmpeg
           # Small packets, so every patch is fragmented.
           ffmpeg/rtp_check.sh ffbuild/ffmpeg 300
+          # sprop-sps and sprop-pps on fmtp lines of their own, and no
+          # parameter set in band: the SDP is all the decoder gets.
+          ffmpeg/rtp_check.sh ffbuild/ffmpeg 1200 split

@@ -4,11 +4,12 @@
 # raw demuxer is held to: the depacketiser has to give back the stream it was
 # given, byte for byte as far as the decoder can tell.
 #
-# usage: ffmpeg/rtp_check.sh path/to/ffmpeg [mtu]
+# usage: ffmpeg/rtp_check.sh path/to/ffmpeg [mtu [split]]
 set -euo pipefail
 
 ffmpeg=$1
 mtu=${2:-1200}
+split=${3:-}
 here=$(cd "$(dirname "$0")" && pwd)
 root=$(dirname "$here")
 tmp=$(mktemp -d)
@@ -21,11 +22,22 @@ for g in "$root"/tests/golden/*.framemd5; do
   [ -f "$s" ] || continue
 
   mkfifo "$tmp/go"
-  python3 "$here/rtp_send.py" "$s" "$tmp/s.sdp" "$port" "$mtu" \
+  python3 "$here/rtp_send.py" "$s" "$tmp/s.sdp" "$port" "$mtu" $split \
     > "$tmp/ready" < "$tmp/go" &
   sender=$!
   exec 3> "$tmp/go"
-  until grep -q sdp "$tmp/ready" 2>/dev/null; do sleep 0.1; done
+  # Ready when it has written the SDP; a sender that dies first, or never
+  # gets there, fails the check rather than hanging it.
+  for _ in $(seq 100); do
+    grep -q sdp "$tmp/ready" 2>/dev/null && break
+    kill -0 "$sender" 2>/dev/null || break
+    sleep 0.1
+  done
+  if ! grep -q sdp "$tmp/ready" 2>/dev/null; then
+    echo "$name: the sender did not start" >&2
+    kill "$sender" 2>/dev/null || true
+    exit 1
+  fi
 
   # Ends when no packet has arrived for three seconds.
   "$ffmpeg" -y -hide_banner -loglevel warning \
@@ -39,7 +51,7 @@ for g in "$root"/tests/golden/*.framemd5; do
   wait "$ff" || true
   rm -f "$tmp/go" "$tmp/ready"
 
-  echo "$name (mtu $mtu):"
+  echo "$name (mtu $mtu${split:+, $split fmtp}):"
   python3 "$here/check_framemd5.py" "$g" "$tmp/out.framemd5"
   port=$((port + 2))
 done
