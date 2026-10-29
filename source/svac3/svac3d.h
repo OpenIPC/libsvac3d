@@ -64,7 +64,8 @@ void svac3d_close(svac3d_t *d);
 
 /* Decode with this many threads; 1, the default, decodes on the caller's
  * thread. The output is the same whatever the number. Returns the number
- * in use (fewer when threads cannot be started), or SVAC3D_ERR_ARG. */
+ * in use (fewer when threads cannot be started, and at most 64), or
+ * SVAC3D_ERR_ARG. */
 int svac3d_set_threads(svac3d_t *d, int threads);
 
 /* Forget every decoded picture, as after a seek; parameter sets are kept.

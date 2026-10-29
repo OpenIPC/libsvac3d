@@ -58,6 +58,8 @@ svac3_pool_t *svac3_pool_create(int threads)
 {
     if (threads < 2)
         return NULL;
+    if (threads > SVAC3_MAX_THREADS)
+        threads = SVAC3_MAX_THREADS;
     svac3_pool_t *p = calloc(1, sizeof(*p));
     if (!p)
         return NULL;

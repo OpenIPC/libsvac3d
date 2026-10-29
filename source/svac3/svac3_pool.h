@@ -11,8 +11,11 @@
 typedef struct svac3_pool svac3_pool_t;
 typedef void (*svac3_pool_fn)(void *arg, int i);
 
-/* threads in all, the caller's included; NULL when threads < 2 or on
- * failure (callers then run serially) */
+/* At most this many threads: the work in a picture divides no further */
+#define SVAC3_MAX_THREADS 64
+
+/* threads in all, the caller's included (at most SVAC3_MAX_THREADS); NULL
+ * when threads < 2 or on failure (callers then run serially) */
 svac3_pool_t *svac3_pool_create(int threads);
 void svac3_pool_destroy(svac3_pool_t *pool);
 int svac3_pool_threads(const svac3_pool_t *pool);

@@ -737,7 +737,7 @@ static void recon_chroma_inter(parser_t *p, int x0, int y0, int w, int h, int qp
  * means reconstructed) consumes them in order, on the same thread or on
  * one of its own. */
 
-enum { REC_CU, REC_CHROMA, REC_PATCH, REC_END };
+enum { REC_CU, REC_CHROMA, REC_PATCH };
 
 typedef struct {
     uint8_t kind;
@@ -745,7 +745,8 @@ typedef struct {
     uint8_t group_start;         /* the CU opens a QP group */
     uint8_t lcu_qp;
     uint8_t patch, patch_qp, fixed_qp;   /* REC_PATCH */
-    int16_t dqp, mvd[2];
+    int16_t dqp;
+    int32_t mvd[2];              /* as parsed: derive_mvp() clips the sum */
     uint16_t x0, y0, w, h;
     const int16_t *coef[3];      /* by component, when its ctp bit is set */
 } cu_rec_t;
@@ -980,7 +981,7 @@ static void coding_unit(parser_t *p, int x0, int y0, int w, int h, int mode, int
         .intra = (uint8_t)intra, .subtype = (uint8_t)subtype, .ref = (uint8_t)ref,
         .lidx = (uint8_t)lidx, .eipm = (uint8_t)eipm, .cidx = (uint8_t)cidx, .ctp = (uint8_t)ctp,
         .group_start = x0 == p->qp_group_x && y0 == p->qp_group_y, .lcu_qp = (uint8_t)p->lcu_qp,
-        .dqp = (int16_t)dqp, .mvd = { (int16_t)mvd[0], (int16_t)mvd[1] },
+        .dqp = (int16_t)dqp, .mvd = { mvd[0], mvd[1] },
         .x0 = (uint16_t)x0, .y0 = (uint16_t)y0, .w = (uint16_t)w, .h = (uint16_t)h,
         .coef = { p->coef[0], p->coef[1], p->coef[2] },
     };
@@ -1352,6 +1353,7 @@ struct svac3_picture {
     rec_chunk_t *rec_head, *rec_tail;
     int tail_n;                  /* records in rec_tail */
     long produced, published;
+    int ending;                  /* every record is published: the worker stops */
     coef_chunk_t *coef_head, *coef_tail;
 
     /* kept for the next picture of a cache: spare chunks, buffer sizes */
@@ -1431,7 +1433,7 @@ static void emit(parser_t *p, cu_rec_t *rec)
     pic->produced++;
 }
 
-/* The reconstruction thread: records in order, until REC_END */
+/* The reconstruction thread: records in order, until they end */
 static void *recon_worker(void *arg)
 {
     svac3_picture_t *pic = arg;
@@ -1440,9 +1442,10 @@ static void *recon_worker(void *arg)
     long done = 0;
     for (;;) {
         pthread_mutex_lock(&pic->lock);
-        while (pic->published == done)
+        while (pic->published == done && !pic->ending)
             pthread_cond_wait(&pic->ready, &pic->lock);
         const long avail = pic->published;
+        const int last = pic->ending;
         if (!ch)
             ch = pic->rec_head;
         pthread_mutex_unlock(&pic->lock);
@@ -1451,11 +1454,10 @@ static void *recon_worker(void *arg)
                 ch = ch->next;
                 idx = 0;
             }
-            const cu_rec_t *rec = &ch->rec[idx++];
-            if (rec->kind == REC_END)
-                return NULL;
-            recon_rec(&pic->r, rec);
+            recon_rec(&pic->r, &ch->rec[idx++]);
         }
+        if (last && done == avail)
+            return NULL;
     }
 }
 
@@ -1464,18 +1466,11 @@ static void finish_worker(svac3_picture_t *pic)
 {
     if (!pic->threaded)
         return;
-    cu_rec_t end = { .kind = REC_END };
-    const int failed = pic->failed;
-    pic->failed = 0;
-    emit(&pic->p, &end);                         /* room for it, or... */
-    if (pic->failed) {
-        /* ...no memory for a last chunk: end in the last record's place */
-        pthread_mutex_lock(&pic->lock);
-        pic->rec_tail->rec[pic->tail_n ? pic->tail_n - 1 : 0].kind = REC_END;
-        pthread_mutex_unlock(&pic->lock);
-    }
-    pic->failed |= failed;
-    publish(pic);
+    pthread_mutex_lock(&pic->lock);
+    pic->published = pic->produced;
+    pic->ending = 1;
+    pthread_cond_signal(&pic->ready);
+    pthread_mutex_unlock(&pic->lock);
     pthread_join(pic->worker, NULL);
     pthread_mutex_destroy(&pic->lock);
     pthread_cond_destroy(&pic->ready);
@@ -1644,7 +1639,7 @@ int svac3_picture_begin_cached(const svac3_hls_t *hls, svac3_frame_t *frame,
     if (!ret && frame && p->pct == 2 && !refs_ok(refs, p->num_ref_active0, frame, p->tmvp))
         ret = SVAC3_ERR_INVALID;
     if (ret) {
-        free(pic);
+        svac3_picture_free(pic);       /* with what the cache had kept */
         return ret;
     }
     p->frame = frame;
@@ -1775,7 +1770,10 @@ void svac3_picture_set_pool(svac3_picture_t *pic, svac3_pool_t *pool)
     if (pool && pic->p.recon && !pic->threaded && !pic->p.next_patch) {
         if (pthread_mutex_init(&pic->lock, NULL))
             return;
-        pthread_cond_init(&pic->ready, NULL);
+        if (pthread_cond_init(&pic->ready, NULL)) {
+            pthread_mutex_destroy(&pic->lock);
+            return;
+        }
         pic->threaded = 1;
         if (pthread_create(&pic->worker, NULL, recon_worker, pic)) {
             pthread_mutex_destroy(&pic->lock);
