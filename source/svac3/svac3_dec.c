@@ -38,6 +38,8 @@ typedef struct {
     int64_t poi;
     int used;
     uint32_t lib_index;      /* library pictures: library_picture_index */
+    int64_t seq;             /* when the buffer took it, in decoding order */
+    int64_t changed;         /* when its picture failed or was decoded again */
 
     /* pictures in flight */
     int holds;               /* pictures in flight using it (the caller's thread's) */
@@ -48,12 +50,20 @@ typedef struct {
 
 /* What the reference lists make of a picture at its first patch */
 typedef struct {
+    int lib;                 /* a library picture, by index */
+    int64_t key;             /* its DOI, or its library_picture_index */
+} ref_t;
+
+typedef struct {
     pic_t *slot;
     int lib;
     uint32_t index;          /* library pictures: library_picture_index */
     int64_t doi, poi;
     int64_t tag;
+    int64_t seq;             /* the buffer's, once it has the picture */
+    int64_t when;            /* the clock when its references were found */
     int keep[DPB_SLOTS];
+    ref_t list0[SVAC3_MAX_REFS];
     svac3_refs_t refs;
     pic_t *ref[SVAC3_MAX_REFS];
 } plan_t;
@@ -71,6 +81,7 @@ typedef struct {
     int npatch, num_patches, patch_cap;
     plan_t plan;
     int ret, done;
+    int refused;             /* not to be decoded: the error it has instead */
     svac3_patch_stats_t st;
 } task_t;
 
@@ -93,6 +104,8 @@ struct svac3_dec {
     int doi_prev, have_prev;
     int64_t last_poi;
     int64_t tag, last_tag;
+    int64_t seq;             /* pictures the buffer has taken */
+    int64_t clock;           /* references found, pictures failed or decoded again */
 
     /* the picture whose patches are being decoded */
     svac3_picture_t *open;
@@ -217,12 +230,17 @@ static int alloc_pic(pic_t *p, int w, int h)
     return SVAC3_OK;
 }
 
-static pic_t *find_doi(svac3_dec_t *d, int64_t doi)
+/* The newest picture with this DOI the buffer took before seq: with
+ * pictures in flight, one it is still to let go of may share it */
+static pic_t *find_doi(svac3_dec_t *d, int64_t doi, int64_t before)
 {
-    for (int i = 0; i < DPB_SLOTS; i++)
-        if (d->pic[i].used && d->pic[i].doi == doi)
-            return &d->pic[i];
-    return NULL;
+    pic_t *f = NULL;
+    for (int i = 0; i < DPB_SLOTS; i++) {
+        pic_t *p = &d->pic[i];
+        if (p->used && p->doi == doi && p->seq < before && (!f || p->seq > f->seq))
+            f = p;
+    }
+    return f;
 }
 
 /* The reference picture list l of the current picture, or NULL */
@@ -238,11 +256,6 @@ static const svac3_rpl_t *rpl_of(const svac3_hls_t *hls, int l)
         return NULL;
     return &s->rpls[l][idx];
 }
-
-typedef struct {
-    int lib;                 /* a library picture, by index */
-    int64_t key;             /* its DOI, or its library_picture_index */
-} ref_t;
 
 /* 5.4.3.3: RefPicDoiList for list l; returns the number of entries */
 static int ref_list(const svac3_rpl_t *r, int64_t doi, ref_t out[SVAC3_MAX_REFS])
@@ -261,18 +274,44 @@ static int ref_list(const svac3_rpl_t *r, int64_t doi, ref_t out[SVAC3_MAX_REFS]
     return n;
 }
 
-static pic_t *find_lib(svac3_dec_t *d, int64_t index)
+static pic_t *find_lib(svac3_dec_t *d, int64_t index, int64_t before)
 {
-    for (int i = 0; i < LIB_SLOTS; i++)
-        if (d->lib[i].used && d->lib[i].lib_index == index)
-            return &d->lib[i];
-    return NULL;
+    pic_t *f = NULL;
+    for (int i = 0; i < LIB_SLOTS; i++) {
+        pic_t *p = &d->lib[i];
+        if (p->used && p->lib_index == index && p->seq < before && (!f || p->seq > f->seq))
+            f = p;
+    }
+    return f;
 }
 
 static int64_t clamp_dist(int64_t dist)
 {
     /* bounded for a conforming stream (POIs within 128); clamp a corrupt one */
     return dist < -32768 ? -32768 : dist > 32767 ? 32767 : dist;
+}
+
+/* The pictures list 0 names, among those the buffer took before seq */
+static int find_refs(svac3_dec_t *d, plan_t *pl, int64_t before)
+{
+    svac3_refs_t *refs = &pl->refs;
+    for (int j = 0; j < refs->num; j++) {
+        const ref_t *e = &pl->list0[j];
+        pic_t *r = e->lib ? find_lib(d, e->key, before) : find_doi(d, e->key, before);
+        if (!r)
+            return SVAC3_ERR_CORRUPT;           /* reference not decoded */
+        pl->ref[j] = r;
+        refs->ref[j] = &r->f;
+        refs->ctx[j] = r;
+        /* a library reference's DistanceIndex is 2 * (POI - 1) (5.4.3.3) */
+        refs->dist[j] = (int)clamp_dist(e->lib ? 2 : 2 * (pl->poi - r->poi));
+        if (j == 0) {
+            refs->col = r->tmv;
+            refs->col_ctx = r;
+        }
+    }
+    pl->when = ++d->clock;
+    return SVAC3_OK;
 }
 
 static void abandon(svac3_dec_t *d)
@@ -364,21 +403,11 @@ static int plan_picture(svac3_dec_t *d, plan_t *pl)
                 keep[i] |= p->used && !list[l][j].lib && p->doi == list[l][j].key;
     }
 
-    svac3_refs_t *refs = &pl->refs;
     if (hls->ph.picture_coding_type == 2) {
-        refs->num = nlist[0];
-        for (int j = 0; j < nlist[0]; j++) {
-            const ref_t *e = &list[0][j];
-            pic_t *r = e->lib ? find_lib(d, e->key) : find_doi(d, e->key);
-            if (!r)
-                return SVAC3_ERR_CORRUPT;       /* reference not decoded */
-            pl->ref[j] = r;
-            refs->ref[j] = &r->f;
-            /* a library reference's DistanceIndex is 2 * (POI - 1) (5.4.3.3) */
-            refs->dist[j] = (int)clamp_dist(e->lib ? 2 : 2 * (poi - r->poi));
-            if (j == 0)
-                refs->col = r->tmv;
-        }
+        pl->refs.num = nlist[0];
+        memcpy(pl->list0, list[0], sizeof(pl->list0));
+        if ((ret = find_refs(d, pl, INT64_MAX)))
+            return ret;
     }
 
     /* a free slot, or failing that one the lists let go: at most
@@ -412,21 +441,34 @@ static int start_picture(svac3_dec_t *d)
                                       &d->cache, &d->open);
 }
 
-/* The buffer takes the picture */
-static void commit(svac3_dec_t *d, const plan_t *pl)
+/* The buffer takes the picture, which later pictures may reference */
+static void add_pic(svac3_dec_t *d, plan_t *pl)
 {
     pic_t *cur = pl->slot;
-    if (pl->lib) {
-        for (int i = 0; i < LIB_SLOTS; i++)
-            d->lib[i].used = 0;
+    if (pl->lib)
         cur->lib_index = pl->index;
-    } else {
-        for (int i = 0; i < DPB_SLOTS; i++)
-            d->pic[i].used = pl->keep[i];
-    }
     cur->used = 1;
     cur->doi = pl->doi;
     cur->poi = pl->poi;
+    cur->seq = pl->seq = ++d->seq;
+    cur->changed = 0;
+}
+
+/* Once the picture has decoded, the buffer lets go of what its lists do
+ * not keep (the library picture it replaces) among the pictures taken
+ * before it: with pictures in flight, those taken after it are not its
+ * to drop, and a picture that fails drops nothing, as on one thread. */
+static void prune(svac3_dec_t *d, const plan_t *pl)
+{
+    if (pl->lib) {
+        for (int i = 0; i < LIB_SLOTS; i++)
+            if (d->lib[i].seq < pl->seq)
+                d->lib[i].used = 0;
+    } else {
+        for (int i = 0; i < DPB_SLOTS; i++)
+            if (d->pic[i].seq < pl->seq && !pl->keep[i])
+                d->pic[i].used = 0;
+    }
 }
 
 /* One patch NAL unit. A picture that loses patches is dropped, and the
@@ -461,7 +503,13 @@ static int decode_patch_nal(svac3_dec_t *d, const uint8_t *rbsp, size_t rl,
         d->open = NULL;
         if ((ret = svac3_picture_end_cached(pic, hls, &d->cache)))
             return ret;
-        commit(d, &d->open_plan);
+        pic_t *s = d->open_plan.slot;
+        add_pic(d, &d->open_plan);
+        prune(d, &d->open_plan);
+        /* complete, should threads be turned on with it as a reference */
+        s->rows = s->h;
+        s->tmv_rows = (s->h + 15) >> 4;
+        s->failed = 0;
         d->last_poi = d->open_plan.poi;
         d->last_tag = d->open_plan.tag;
         *out = &d->open_plan.slot->f;
@@ -505,7 +553,7 @@ static void on_progress(void *ctx, int rows, int tmv_rows)
 
 static void wait_on(pic_t *s, const int *v, int rows)
 {
-    if (load(v) >= rows)
+    if (load(v) >= rows || !s->dec)
         return;
     svac3_dec_t *d = s->dec;
     pthread_mutex_lock(&d->lock);
@@ -533,7 +581,9 @@ static void run_task(task_t *t, svac3_picture_cache_t *cache, svac3_pool_t *pool
     const int inter = !pl->lib && t->hls.ph.picture_coding_type == 2;
     svac3_picture_t *pic;
     memset(&t->st, 0, sizeof(t->st));
-    int ret = svac3_picture_begin_cached(&t->hls, &s->f, inter ? &pl->refs : NULL, s->tmv,
+    int ret = t->refused;
+    if (!ret)
+        ret = svac3_picture_begin_cached(&t->hls, &s->f, inter ? &pl->refs : NULL, s->tmv,
                                          cache, &pic);
     if (!ret) {
         svac3_picture_set_progress(pic, on_progress, s);
@@ -552,7 +602,7 @@ static void run_task(task_t *t, svac3_picture_cache_t *cache, svac3_pool_t *pool
             ret = svac3_picture_end_cached(pic, &t->hls, cache);
     }
     /* a picture made from a reference that failed failed too */
-    for (int j = 0; inter && j < pl->refs.num; j++) {
+    for (int j = 0; inter && !t->refused && j < pl->refs.num; j++) {
         wait_rows(pl->ref[j], pl->ref[j]->h);
         if (!ret && load(&pl->ref[j]->failed))
             ret = SVAC3_ERR_CORRUPT;
@@ -584,18 +634,54 @@ static void *worker_main(void *arg)
     return NULL;
 }
 
-/* The slots a planned picture uses are held while it is in flight */
-static void hold(plan_t *pl, int by)
+static void hold_refs(plan_t *pl, int by)
 {
-    pl->slot->holds += by;
     for (int j = 0; j < SVAC3_MAX_REFS; j++)
         if (pl->ref[j])
             pl->ref[j]->holds += by;
 }
 
+/* The slots a planned picture uses are held while it is in flight */
+static void hold(plan_t *pl, int by)
+{
+    pl->slot->holds += by;
+    hold_refs(pl, by);
+}
+
+/* A picture was decoded from a reference that has since failed, or been
+ * decoded again: one thread would have found its references after that */
+static int stale(const plan_t *pl)
+{
+    for (int j = 0; j < SVAC3_MAX_REFS; j++)
+        if (pl->ref[j] && pl->ref[j]->changed > pl->when)
+            return 1;
+    return 0;
+}
+
+/* Its references found again, among the pictures before it: an error if
+ * one is missing now */
+static int refind(svac3_dec_t *d, plan_t *pl)
+{
+    hold_refs(pl, -1);
+    memset(pl->ref, 0, sizeof(pl->ref));
+    const int ret = find_refs(d, pl, pl->seq ? pl->seq : INT64_MAX);
+    hold_refs(pl, 1);
+    return ret;
+}
+
 static void spare_task(svac3_dec_t *d, task_t *t)
 {
     hold(&t->plan, -1);
+    /* what it keeps for the next picture: buffers of the size this one's
+     * patches needed, not a larger one's from before */
+    for (int i = 0; i < t->patch_cap; i++) {
+        patch_buf_t *pb = &t->patch[i];
+        if (i >= t->npatch || pb->cap > 2 * pb->len + 65536) {
+            free(pb->data);
+            pb->data = NULL;
+            pb->cap = 0;
+        }
+    }
     d->spare[d->nspare++] = t;
 }
 
@@ -608,7 +694,8 @@ static void drop_collect(svac3_dec_t *d)
 
 /* The oldest picture in flight leaves, once done: to the output function
  * when emit is set. A picture that failed leaves the buffer, as one that
- * fails on the caller's thread never enters it. */
+ * fails on the caller's thread never enters it; one that decoded prunes
+ * it. */
 static int retire(svac3_dec_t *d, int wait, int emit)
 {
     if (!d->n)
@@ -627,8 +714,24 @@ static int retire(svac3_dec_t *d, int wait, int emit)
     if (!done)
         return 0;
     pic_t *s = t->plan.slot;
-    if (t->ret)
+    if (stale(&t->plan)) {
+        /* decoded again on this thread once nothing in flight reads it */
+        pthread_mutex_lock(&d->lock);
+        for (int i = 0; i < d->n; i++)
+            while (!d->ring[(d->head + i) % SVAC3_MAX_THREADS]->done)
+                pthread_cond_wait(&d->cond, &d->lock);
+        pthread_mutex_unlock(&d->lock);
+        t->refused = refind(d, &t->plan);
+        s->rows = s->tmv_rows = s->failed = 0;
+        run_task(t, &d->cache, NULL);
+        s->changed = ++d->clock;
+    }
+    if (t->ret) {
         s->used = 0;
+        s->changed = ++d->clock;
+    } else {
+        prune(d, &t->plan);
+    }
     d->st = t->st;
     d->last_poi = t->plan.poi;
     d->last_tag = t->plan.tag;
@@ -660,15 +763,15 @@ static void drain(svac3_dec_t *d, int emit)
 static void dispatch(svac3_dec_t *d, task_t *t)
 {
     plan_t *pl = &t->plan;
-    commit(d, pl);
+    t->refused = 0;
+    if (stale(pl))                              /* a reference failed since */
+        t->refused = refind(d, pl);
+    add_pic(d, pl);
     pic_t *s = pl->slot;
     s->dec = d;
     s->rows = s->tmv_rows = s->failed = 0;      /* no thread uses the slot */
     pl->refs.wait = wait_rows;
     pl->refs.wait_tmv = wait_tmv;
-    for (int j = 0; j < SVAC3_MAX_REFS; j++)
-        pl->refs.ctx[j] = pl->ref[j];
-    pl->refs.col_ctx = pl->ref[0];
     t->done = 0;
     t->ret = 0;
     while (retire(d, 0, 1))                     /* what is done, out first */

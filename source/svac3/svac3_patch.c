@@ -689,10 +689,9 @@ static void ref_wait(const parser_t *p, int ref, int y0, int h, int mvy)
     const int luma = (((y0 << 2) + mvy) >> 2) + h + 4;
     const int chroma = 2 * (((((y0 >> 1) * 2 << 2) + mvy) >> 3) + h / 2 + 2);
     int need = luma > chroma ? luma : chroma;
-    if (need > p->pic_h)
-        need = p->pic_h;
-    if (need > 0)
-        p->refs->wait(p->refs->ctx[ref], need);
+    /* reads above the picture are of its first row */
+    need = need < 1 ? 1 : need > p->pic_h ? p->pic_h : need;
+    p->refs->wait(p->refs->ctx[ref], need);
 }
 
 static void recon_inter(parser_t *p, int x0, int y0, int w, int h, int ref, const int mv[2],

@@ -1,4 +1,4 @@
-From 27876dcaf30a7bbb10f3e603374c2a42c5270227 Mon Sep 17 00:00:00 2001
+From 97083a1788ba49dcda36f32b05c9bfeb922a5ca5 Mon Sep 17 00:00:00 2001
 From: Dmitry Ilyin <d.ilyin@openipc.org>
 Date: Wed, 28 Oct 2026 23:38:39 +0300
 Subject: [PATCH] avcodec: add SVAC 3.0 decoding via libsvac3d
@@ -13,14 +13,14 @@ tool set of the GB/T SVAC 3.0 draft.
  libavcodec/allcodecs.c    |   1 +
  libavcodec/codec_desc.c   |   7 ++
  libavcodec/codec_id.h     |   1 +
- libavcodec/libsvac3d.c    | 244 ++++++++++++++++++++++++++++++++++++++
+ libavcodec/libsvac3d.c    | 251 ++++++++++++++++++++++++++++++++++++++
  libavcodec/parsers.c      |   1 +
  libavcodec/svac3.h        |  56 +++++++++
- libavcodec/svac3_parser.c | 121 +++++++++++++++++++
+ libavcodec/svac3_parser.c | 121 ++++++++++++++++++
  libavformat/Makefile      |   1 +
  libavformat/allformats.c  |   1 +
  libavformat/svac3dec.c    |  64 ++++++++++
- 12 files changed, 504 insertions(+)
+ 12 files changed, 511 insertions(+)
  create mode 100644 libavcodec/libsvac3d.c
  create mode 100644 libavcodec/svac3.h
  create mode 100644 libavcodec/svac3_parser.c
@@ -127,10 +127,10 @@ index 668a068..a089876 100644
      AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs
 diff --git a/libavcodec/libsvac3d.c b/libavcodec/libsvac3d.c
 new file mode 100644
-index 0000000..ff4110c
+index 0000000..94f44cb
 --- /dev/null
 +++ b/libavcodec/libsvac3d.c
-@@ -0,0 +1,244 @@
+@@ -0,0 +1,251 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -163,7 +163,12 @@ index 0000000..ff4110c
 +#include "codec_internal.h"
 +#include "decode.h"
 +
-+/* the timing of a packet, found again by the tag its pictures carry */
++/* The timing of a packet, found again by the tag its pictures carry. A
++ * picture is out at most a few pictures after its packet, so one this many
++ * packets back (after a run of packets with no picture, or with pictures
++ * in error) is not needed any more. */
++#define MAX_PROPS 256
++
 +typedef struct PacketProps {
 +    int64_t tag;
 +    int64_t pts, dts, duration;
@@ -345,6 +350,8 @@ index 0000000..ff4110c
 +                .tag = ++s->tag, .pts = s->pkt->pts, .dts = s->pkt->dts,
 +                .duration = s->pkt->duration,
 +            };
++            if (av_fifo_can_read(s->props) >= MAX_PROPS)
++                av_fifo_drain2(s->props, 1);
 +            s->err = av_fifo_write(s->props, &p, 1);
 +            if (s->err >= 0)
 +                ret = svac3d_decode_tag(s->dec, s->pkt->data, s->pkt->size, p.tag,

@@ -53,6 +53,91 @@ static void out(void *opaque, const svac3d_picture_t *pic)
     s->tags = (s->tags ^ (uint64_t)pic->tag) * 0x100000001b3ULL;
 }
 
+/* Where access units begin: before every SPS or picture header that
+ * follows a patch. Returns how many of at most max were found. */
+static int au_cuts(const uint8_t *buf, size_t len, size_t *cuts, int max)
+{
+    size_t pos = 0, nal_len;
+    const uint8_t *nal;
+    int n = 0, patch = 0;
+    while (svac3_next_nal(buf, len, &pos, &nal, &nal_len) && n < max) {
+        const unsigned t = nal_len >= 2 ? nal[1] & 31u : 0;
+        if (patch && (t == SVAC3_NAL_SPS || t == SVAC3_NAL_PIC_HEAD)) {
+            /* this unit's start code begins at most 4 bytes before it */
+            size_t cut = (size_t)(nal - buf) - 3;
+            if (buf[cut - 1] == 0)
+                cut--;
+            cuts[n++] = cut;
+            patch = 0;
+        }
+        patch |= svac3_nal_is_patch(t);
+    }
+    return n;
+}
+
+/* The pictures and the first error of decoding buf whole on threads */
+static int decode_all(const uint8_t *buf, size_t len, int threads, sink_t *s)
+{
+    svac3d_t *d = svac3d_open();
+    if (!d)
+        return SVAC3D_ERR_NOMEM;
+    svac3d_set_threads(d, threads);
+    int err = svac3d_decode(d, buf, len, out, s);
+    const int e2 = svac3d_flush(d, out, s);
+    if (!err)
+        err = e2;
+    svac3d_close(d);
+    return err;
+}
+
+/* A patch whose data is damaged, found only once it is decoded (on a
+ * picture thread, with threads): the pictures and the loss are the same
+ * on one thread and on four. Damaged are a P picture's first patch, and
+ * the second I picture's, which on one thread leaves the pictures before
+ * it in the buffer (with a library stream, the library picture it would
+ * have replaced). */
+static void corrupt_patch_checks(const uint8_t *buf, size_t len)
+{
+    for (int target = 0; target < 2; target++) {
+        size_t pos = 0, nal_len;
+        const uint8_t *nal;
+        int pictures = 0, intra = 0;
+        size_t at = 0, n = 0;
+        static svac3_hls_t h;
+        memset(&h, 0, sizeof(h));
+        while (svac3_next_nal(buf, len, &pos, &nal, &nal_len)) {
+            if (nal_len < 2 || svac3_parse_nal(&h, nal, nal_len, 0, NULL))
+                continue;
+            if (!svac3_nal_is_patch(nal[1] & 31u) || h.patch.patch_index != 0)
+                continue;
+            pictures++;
+            intra += h.ph.picture_coding_type == 1;
+            if (!n && (target ? intra == 2 && h.ph.picture_coding_type == 1 : pictures == 3)) {
+                at = (size_t)(nal - buf) + nal_len / 2;     /* past its header */
+                n = nal_len / 4;
+            }
+        }
+        if (target && intra < 2)
+            continue;                    /* no second I picture */
+        CHECK(pictures > 4 && n > 0);
+        uint8_t *bad = malloc(len);
+        if (!bad)
+            return;
+        memcpy(bad, buf, len);
+        for (size_t i = 0; i < n; i++)
+            bad[at + i] = (uint8_t)(0x5a ^ i);   /* never 0: no start code appears */
+        sink_t one = { 0xcbf29ce484222325ULL, 0, 0, 0, 0 }, four = one;
+        const int e1 = decode_all(bad, len, 1, &one), e4 = decode_all(bad, len, 4, &four);
+        CHECK(e1 != 0 && e4 != 0);
+        CHECK(one.pics >= 2 && one.pics < pictures);
+        CHECK(four.pics == one.pics && four.hash == one.hash);
+        if (four.pics != one.pics)
+            fprintf(stderr, "damaged %s: %d pictures on 1 thread, %d on 4\n",
+                    target ? "second I picture" : "picture 2", one.pics, four.pics);
+        free(bad);
+    }
+}
+
 /* A stream of several patches per picture, with the first picture's last
  * patch removed, in one buffer: the call reports the loss and still gives
  * every picture the units complete, as the internal decoder fed the same
@@ -131,6 +216,7 @@ int main(int argc, char **argv)
         if (!buf)
             return 1;
         lost_patch_checks(buf, len);
+        corrupt_patch_checks(buf, len);
         free(buf);
         if (failures)
             fprintf(stderr, "%d check(s) failed\n", failures);
@@ -254,6 +340,33 @@ int main(int argc, char **argv)
     CHECK(svac3d_flush(d, out, &v) == 0 && v.pics == 0);         /* nothing with one */
     svac3d_close(d);
     CHECK(svac3d_flush(NULL, out, NULL) == SVAC3D_ERR_ARG);
+
+    /* the number changed mid-stream, at an access unit: references
+     * decoded on one thread serve pictures threads decode, and back */
+    size_t cuts[512];
+    const int ncut = au_cuts(buf, len, cuts, 512);
+    CHECK(ncut > 4);
+    if (ncut > 4) {
+        const size_t mid = cuts[ncut / 2];
+        d = svac3d_open();
+        sink_t w = { 0xcbf29ce484222325ULL, 0, 0, 0, 0 };
+        CHECK(svac3d_decode(d, buf, mid, out, &w) == 0);
+        CHECK(svac3d_set_threads(d, 4) >= 1);
+        CHECK(svac3d_decode(d, buf + mid, len - mid, out, &w) == 0);
+        CHECK(svac3d_flush(d, out, &w) == 0);
+        CHECK(w.pics == ref.pics && w.hash == ref.hash);
+        svac3d_close(d);
+
+        d = svac3d_open();
+        sink_t x = { 0xcbf29ce484222325ULL, 0, 0, 0, 0 };
+        CHECK(svac3d_set_threads(d, 4) >= 1);
+        CHECK(svac3d_decode(d, buf, mid, out, &x) == 0);
+        CHECK(svac3d_flush(d, out, &x) == 0);   /* before the number changes */
+        CHECK(svac3d_set_threads(d, 1) == 1);
+        CHECK(svac3d_decode(d, buf + mid, len - mid, out, &x) == 0);
+        CHECK(x.pics == ref.pics && x.hash == ref.hash);
+        svac3d_close(d);
+    }
 
     CHECK(svac3d_decode(NULL, buf, len, out, NULL) == SVAC3D_ERR_ARG);
     /* a NAL unit too short for its header is an error, not skipped */

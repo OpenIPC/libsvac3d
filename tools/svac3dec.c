@@ -90,8 +90,14 @@ int main(int argc, char **argv)
         const svac3_frame_t *fr;
         int ret = svac3_dec_nal(dec, nal, nal_len, &fr);
         if (ret == SVAC3_ERR_CORRUPT && svac3_nal_is_patch(nal[1] & 31u)) {
-            fprintf(stderr, "picture %d: patch data out of sync from LCU %u, or reference missing\n",
-                    sink.pics, svac3_dec_stats(dec)->first_bad_lcu);
+            /* with threads, patch data is decoded later: the error here is
+             * a patch lost or out of order, or a missing reference */
+            if (threads > 1)
+                fprintf(stderr, "NAL unit %u: a patch lost or out of order, or reference missing\n",
+                        this_idx);
+            else
+                fprintf(stderr, "picture %d: patch data out of sync from LCU %u, or reference missing\n",
+                        sink.pics, svac3_dec_stats(dec)->first_bad_lcu);
             goto out;
         }
         if (ret) {

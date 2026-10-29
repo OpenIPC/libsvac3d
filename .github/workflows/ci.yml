@@ -52,6 +52,7 @@ jobs:
           done
           build/test_api tests/streams/cv608_synth_1080p_cbr2m.svac3
           build/test_api -lost tests/streams/cv608_patch4_1080p.svac3
+          build/test_api -lost tests/streams/cv608_smartp_1080p.svac3
 
   fuzz:
     runs-on: ubuntu-24.04
