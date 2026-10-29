@@ -31,6 +31,7 @@ typedef struct {
     uint64_t hash;
     int pics, last_type;
     int64_t last_poi;
+    uint64_t tags;           /* FNV-1a over the pictures' tags */
 } sink_t;
 
 static void hash_plane(uint64_t *h, const uint8_t *p, int stride, int w, int rows)
@@ -49,6 +50,7 @@ static void out(void *opaque, const svac3d_picture_t *pic)
     s->pics++;
     s->last_type = pic->pict_type;
     s->last_poi = pic->poi;
+    s->tags = (s->tags ^ (uint64_t)pic->tag) * 0x100000001b3ULL;
 }
 
 /* A stream of several patches per picture, with the first picture's last
@@ -106,7 +108,17 @@ static void lost_patch_checks(const uint8_t *buf, size_t len)
     svac3d_t *d = svac3d_open();
     sink_t got = { 0xcbf29ce484222325ULL, 0, 0, 0 };
     CHECK(svac3d_decode(d, lost, lost_len, out, &got) == SVAC3D_ERR_CORRUPT);
+    CHECK(svac3d_flush(d, out, &got) == 0);
     CHECK(got.pics > 0 && got.pics < pictures && got.pics == want.pics && got.hash == want.hash);
+    svac3d_close(d);
+
+    /* with picture threads, the same pictures and the same loss */
+    d = svac3d_open();
+    CHECK(svac3d_set_threads(d, 4) >= 1);
+    sink_t thr = { 0xcbf29ce484222325ULL, 0, 0, 0 };
+    CHECK(svac3d_decode(d, lost, lost_len, out, &thr) == SVAC3D_ERR_CORRUPT);
+    CHECK(svac3d_flush(d, out, &thr) == 0);
+    CHECK(thr.pics == want.pics && thr.hash == want.hash);
     svac3d_close(d);
     free(lost);
 }
@@ -176,7 +188,7 @@ int main(int argc, char **argv)
     sink_t b = { 0xcbf29ce484222325ULL, 0, 0, 0 };
     size_t pos = 0, start = 0, nal_len;
     const uint8_t *nal;
-    int patch = 0;
+    int patch = 0, au = 0;
     while (svac3_next_nal(buf, len, &pos, &nal, &nal_len)) {
         const unsigned t = nal_len >= 2 ? nal[1] & 31u : 0;
         if (patch && (t == SVAC3_NAL_SPS || t == SVAC3_NAL_PIC_HEAD)) {
@@ -184,14 +196,15 @@ int main(int argc, char **argv)
             size_t cut = (size_t)(nal - buf) - 3;
             if (cut > start && buf[cut - 1] == 0)
                 cut--;
-            CHECK(svac3d_decode(d, buf + start, cut - start, out, &b) == 0);
+            CHECK(svac3d_decode_tag(d, buf + start, cut - start, ++au, out, &b) == 0);
             start = cut;
             patch = 0;
         }
         patch |= svac3_nal_is_patch(t);
     }
-    CHECK(svac3d_decode(d, buf + start, len - start, out, &b) == 0);
+    CHECK(svac3d_decode_tag(d, buf + start, len - start, ++au, out, &b) == 0);
     CHECK(b.pics == ref.pics && b.hash == ref.hash);
+    CHECK(b.pics == au);                      /* a picture per access unit, tagged */
 
     /* after a reset, P pictures are refused until the next I picture */
     svac3d_reset(d);
@@ -199,15 +212,48 @@ int main(int argc, char **argv)
     CHECK(svac3d_decode(d, buf + start, len - start, out, &c) == SVAC3D_ERR_CORRUPT && c.pics == 0);
     svac3d_close(d);
 
-    /* threads: the same pictures, whole stream or access unit by unit */
+    /* threads: the same pictures, whole stream or access unit by unit,
+     * the last of them from svac3d_flush() */
     d = svac3d_open();
     CHECK(svac3d_set_threads(d, 0) == SVAC3D_ERR_ARG && svac3d_set_threads(NULL, 2) == SVAC3D_ERR_ARG);
     CHECK(svac3d_set_threads(d, 4) >= 1);
     sink_t t = { 0xcbf29ce484222325ULL, 0, 0, 0 };
     CHECK(svac3d_decode(d, buf, len, out, &t) == 0);
+    CHECK(svac3d_flush(d, out, &t) == 0);
     CHECK(t.pics == ref.pics && t.hash == ref.hash);
+    CHECK(t.last_type == 2 && t.last_poi == a.last_poi);
+    svac3d_reset(d);
+    sink_t u = { 0xcbf29ce484222325ULL, 0, 0, 0 };
+    int behind = 0;
+    pos = start = 0;
+    patch = 0;
+    while (svac3_next_nal(buf, len, &pos, &nal, &nal_len)) {
+        const unsigned ty = nal_len >= 2 ? nal[1] & 31u : 0;
+        if (patch && (ty == SVAC3_NAL_SPS || ty == SVAC3_NAL_PIC_HEAD)) {
+            size_t cut = (size_t)(nal - buf) - 3;
+            if (cut > start && buf[cut - 1] == 0)
+                cut--;
+            CHECK(svac3d_decode_tag(d, buf + start, cut - start, ++behind, out, &u) == 0);
+            start = cut;
+            patch = 0;
+        }
+        patch |= svac3_nal_is_patch(ty);
+    }
+    CHECK(svac3d_decode_tag(d, buf + start, len - start, ++behind, out, &u) == 0);
+    CHECK(u.pics <= behind);
+    CHECK(svac3d_flush(d, out, &u) == 0);
+    CHECK(u.pics == ref.pics && u.hash == ref.hash);
+    CHECK(u.tags == b.tags);                  /* each picture keeps its access unit's tag */
+    CHECK(svac3d_flush(d, out, &u) == 0 && u.pics == ref.pics);   /* nothing left */
+    /* a reset drops the pictures in flight; P pictures are refused after it */
+    svac3d_reset(d);
+    sink_t v = { 0xcbf29ce484222325ULL, 0, 0, 0 };
+    CHECK(svac3d_decode(d, buf + start, len - start, out, &v) == SVAC3D_ERR_CORRUPT);
+    CHECK(svac3d_flush(d, out, &v) == 0 && v.pics == 0);
     CHECK(svac3d_set_threads(d, 1) == 1);
+    CHECK(svac3d_flush(d, out, &v) == 0 && v.pics == 0);         /* nothing with one */
     svac3d_close(d);
+    CHECK(svac3d_flush(NULL, out, NULL) == SVAC3D_ERR_ARG);
 
     CHECK(svac3d_decode(NULL, buf, len, out, NULL) == SVAC3D_ERR_ARG);
     /* a NAL unit too short for its header is an error, not skipped */

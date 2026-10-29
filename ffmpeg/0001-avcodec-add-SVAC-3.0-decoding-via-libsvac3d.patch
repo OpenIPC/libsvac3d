@@ -1,4 +1,4 @@
-From 0000000000000000000000000000000000000000 Mon Sep 17 00:00:00 2001
+From 27876dcaf30a7bbb10f3e603374c2a42c5270227 Mon Sep 17 00:00:00 2001
 From: Dmitry Ilyin <d.ilyin@openipc.org>
 Date: Wed, 28 Oct 2026 23:38:39 +0300
 Subject: [PATCH] avcodec: add SVAC 3.0 decoding via libsvac3d
@@ -13,21 +13,21 @@ tool set of the GB/T SVAC 3.0 draft.
  libavcodec/allcodecs.c    |   1 +
  libavcodec/codec_desc.c   |   7 ++
  libavcodec/codec_id.h     |   1 +
- libavcodec/libsvac3d.c    | 206 ++++++++++++++++++++++++++++++++++++++
+ libavcodec/libsvac3d.c    | 244 ++++++++++++++++++++++++++++++++++++++
  libavcodec/parsers.c      |   1 +
- libavcodec/svac3.h        |  56 +++++++++++
- libavcodec/svac3_parser.c | 121 ++++++++++++++++++++++
+ libavcodec/svac3.h        |  56 +++++++++
+ libavcodec/svac3_parser.c | 121 +++++++++++++++++++
  libavformat/Makefile      |   1 +
  libavformat/allformats.c  |   1 +
- libavformat/svac3dec.c    |  64 ++++++++++++
- 12 files changed, 466 insertions(+)
+ libavformat/svac3dec.c    |  64 ++++++++++
+ 12 files changed, 504 insertions(+)
  create mode 100644 libavcodec/libsvac3d.c
  create mode 100644 libavcodec/svac3.h
  create mode 100644 libavcodec/svac3_parser.c
  create mode 100644 libavformat/svac3dec.c
 
 diff --git a/configure b/configure
-index 374bd5c..6fd5725 100755
+index 374bd5c..61c7b77 100755
 --- a/configure
 +++ b/configure
 @@ -290,6 +290,7 @@ External library support:
@@ -59,7 +59,7 @@ index 374bd5c..6fd5725 100755
  enabled libtwolame        && require libtwolame twolame.h twolame_init -ltwolame &&
                               { check_lib libtwolame twolame.h twolame_encode_buffer_float32_interleaved -ltwolame ||
                                 die "ERROR: libtwolame must be installed and version must be >= 0.3.10"; }
-+enabled libsvac3d         && require_pkg_config libsvac3d "libsvac3d >= 0.2.0" svac3d.h svac3d_set_threads
++enabled libsvac3d         && require_pkg_config libsvac3d "libsvac3d >= 0.3.0" svac3d.h svac3d_flush
  enabled libuavs3d         && require_pkg_config libuavs3d "uavs3d >= 1.1.41" uavs3d.h uavs3d_decode
  enabled libv4l2           && require_pkg_config libv4l2 libv4l2 libv4l2.h v4l2_ioctl
  enabled libvidstab        && require_pkg_config libvidstab "vidstab >= 0.98" vid.stab/libvidstab.h vsMotionDetectInit
@@ -127,10 +127,10 @@ index 668a068..a089876 100644
      AV_CODEC_ID_FIRST_AUDIO = 0x10000,     ///< A dummy id pointing at the start of audio codecs
 diff --git a/libavcodec/libsvac3d.c b/libavcodec/libsvac3d.c
 new file mode 100644
-index 0000000..e69d957
+index 0000000..ff4110c
 --- /dev/null
 +++ b/libavcodec/libsvac3d.c
-@@ -0,0 +1,206 @@
+@@ -0,0 +1,244 @@
 +/*
 + * This file is part of FFmpeg.
 + *
@@ -163,11 +163,20 @@ index 0000000..e69d957
 +#include "codec_internal.h"
 +#include "decode.h"
 +
++/* the timing of a packet, found again by the tag its pictures carry */
++typedef struct PacketProps {
++    int64_t tag;
++    int64_t pts, dts, duration;
++} PacketProps;
++
 +typedef struct LibSVAC3DContext {
 +    svac3d_t *dec;
 +    AVCodecContext *avctx;
 +    AVPacket *pkt;
 +    AVFifo *frames;          ///< decoded pictures not yet returned, AVFrame *
++    AVFifo *props;           ///< PacketProps of the packets pictures may still come from
++    int64_t tag;             ///< of the last packet decoded
++    int drained;             ///< the pictures still in flight at EOF are out
 +    int err;                 ///< error raised inside the output callback
 +    int pending_err;         ///< error to return once the queued pictures are out
 +} LibSVAC3DContext;
@@ -221,6 +230,18 @@ index 0000000..e69d957
 +        av_image_copy_plane(frame->data[i], frame->linesize[i],
 +                            pic->data[i], pic->linesize[i], w, h);
 +    }
++    /* with threads a picture comes out some packets after its own: its
++     * timing is that of the packet its tag names, not the last one */
++    for (PacketProps p; av_fifo_peek(s->props, &p, 1, 0) >= 0; av_fifo_drain2(s->props, 1)) {
++        if (p.tag < pic->tag)
++            continue;
++        if (p.tag == pic->tag) {
++            frame->pts      = p.pts;
++            frame->pkt_dts  = p.dts;
++            frame->duration = p.duration;
++        }
++        break;
++    }
 +    frame->pict_type = pic->pict_type == 1 ? AV_PICTURE_TYPE_I : AV_PICTURE_TYPE_P;
 +    if (pic->pict_type == 1)
 +        frame->flags |= AV_FRAME_FLAG_KEY;
@@ -248,8 +269,9 @@ index 0000000..e69d957
 +    s->avctx  = avctx;
 +    s->pkt    = av_packet_alloc();
 +    s->frames = av_fifo_alloc2(2, sizeof(AVFrame *), AV_FIFO_FLAG_AUTO_GROW);
++    s->props  = av_fifo_alloc2(8, sizeof(PacketProps), AV_FIFO_FLAG_AUTO_GROW);
 +    s->dec    = svac3d_open();
-+    if (!s->pkt || !s->frames || !s->dec)
++    if (!s->pkt || !s->frames || !s->props || !s->dec)
 +        return AVERROR(ENOMEM);
 +    avctx->pix_fmt = AV_PIX_FMT_YUV420P;
 +    /* libsvac3d runs its own threads: 0 asks for one per CPU */
@@ -273,6 +295,7 @@ index 0000000..e69d957
 +
 +    drop_frames(s);
 +    av_fifo_freep2(&s->frames);
++    av_fifo_freep2(&s->props);
 +    av_packet_free(&s->pkt);
 +    svac3d_close(s->dec);
 +    s->dec = NULL;
@@ -284,7 +307,9 @@ index 0000000..e69d957
 +    LibSVAC3DContext *s = avctx->priv_data;
 +
 +    drop_frames(s);
++    av_fifo_reset2(s->props);
 +    s->pending_err = 0;
++    s->drained = 0;
 +    svac3d_reset(s->dec);
 +}
 +
@@ -308,11 +333,24 @@ index 0000000..e69d957
 +        }
 +
 +        ret = ff_decode_get_packet(avctx, s->pkt);
-+        if (ret < 0)
-+            return ret;                     /* EAGAIN, or EOF: no pictures are held back */
-+        s->err = 0;
-+        ret = svac3d_decode(s->dec, s->pkt->data, s->pkt->size, svac3d_output, s);
-+        av_packet_unref(s->pkt);
++        if (ret == AVERROR_EOF && !s->drained) {
++            /* the pictures other threads are still decoding */
++            s->drained = 1;
++            s->err = 0;
++            ret = svac3d_flush(s->dec, svac3d_output, s);
++        } else if (ret < 0) {
++            return ret;
++        } else {
++            const PacketProps p = {
++                .tag = ++s->tag, .pts = s->pkt->pts, .dts = s->pkt->dts,
++                .duration = s->pkt->duration,
++            };
++            s->err = av_fifo_write(s->props, &p, 1);
++            if (s->err >= 0)
++                ret = svac3d_decode_tag(s->dec, s->pkt->data, s->pkt->size, p.tag,
++                                        svac3d_output, s);
++            av_packet_unref(s->pkt);
++        }
 +        if (s->err < 0) {
 +            s->pending_err = s->err;
 +        } else if (ret < 0) {
@@ -333,7 +371,7 @@ index 0000000..e69d957
 +    .close          = libsvac3d_close,
 +    .flush          = libsvac3d_flush,
 +    FF_CODEC_RECEIVE_FRAME_CB(libsvac3d_receive_frame),
-+    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_OTHER_THREADS,
++    .p.capabilities = AV_CODEC_CAP_DR1 | AV_CODEC_CAP_DELAY | AV_CODEC_CAP_OTHER_THREADS,
 +    .caps_internal  = FF_CODEC_CAP_INIT_CLEANUP | FF_CODEC_CAP_AUTO_THREADS,
 +    .p.wrapper_name = "libsvac3d",
 +};

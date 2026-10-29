@@ -55,6 +55,16 @@ typedef struct {
     int dist[SVAC3_MAX_REFS];                 /* BlockDistance: DistanceIndex of the
                                                  current picture minus the reference's */
     const svac3_tmv_t *col;                   /* temporal motion of ref[0] */
+
+    /* For pictures decoded at the same time as their references: wait()
+     * returns once picture ref[i] (ctx[i]) has its first rows luma rows,
+     * and rows / 2 chroma rows, final; wait_tmv() once the first rows rows
+     * of 16x16 temporal motion of ref[0] (col_ctx) are stored. NULL when
+     * the references are complete. */
+    void (*wait)(void *ctx, int rows);
+    void *ctx[SVAC3_MAX_REFS];
+    void (*wait_tmv)(void *ctx, int rows);
+    void *col_ctx;
 } svac3_refs_t;
 
 /* Number of svac3_tmv_t a picture of this size stores. */
@@ -100,6 +110,14 @@ int svac3_picture_end(svac3_picture_t *pic, const svac3_hls_t *hls);
 
 /* Run the picture's loop filters on pool's threads (NULL: on the caller) */
 void svac3_picture_set_pool(svac3_picture_t *pic, svac3_pool_t *pool);
+
+/* Report how far the picture is: progress(ctx, rows, tmv_rows) after each
+ * step, with the luma rows (rows / 2 chroma rows) that are final or the
+ * rows of temporal motion stored, the other -1 (they come from different
+ * threads); and once more, with all of both, when it ends (also when it
+ * ends in error). */
+typedef void (*svac3_progress_fn)(void *ctx, int rows, int tmv_rows);
+void svac3_picture_set_progress(svac3_picture_t *pic, svac3_progress_fn fn, void *ctx);
 
 /* Free a picture without finishing it. */
 void svac3_picture_free(svac3_picture_t *pic);

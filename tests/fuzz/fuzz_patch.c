@@ -7,7 +7,9 @@
  * Build: clang -g -O1 -fsanitize=fuzzer,address,undefined -Isource/svac3 \
  *          tests/fuzz/fuzz_patch.c source/svac3/svac3_hls.c source/svac3/svac3_aec.c \
  *          source/svac3/svac3_patch.c source/svac3/svac3_recon.c \
- *          source/svac3/svac3_loopfilter.c source/svac3/svac3_inter.c source/svac3/svac3_dec.c
+ *          source/svac3/svac3_loopfilter.c source/svac3/svac3_inter.c source/svac3/svac3_dec.c \
+ *          source/svac3/svac3_dsp.c source/svac3/svac3_pool.c -lpthread
+ * With -DFUZZ_THREADS=n the pictures are decoded on n picture threads.
  */
 #include <stdlib.h>
 #include <string.h>
@@ -24,6 +26,9 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
 
     if (!dec)
         return 0;
+#ifdef FUZZ_THREADS
+    svac3_dec_set_threads(dec, FUZZ_THREADS);
+#endif
     memset(&peek, 0, sizeof(peek));
     while (svac3_next_nal(data, size, &pos, &nal, &nal_len)) {
         if (nal_len < 2 || svac3_parse_nal(&peek, nal, nal_len, 0, NULL))
@@ -39,6 +44,7 @@ int LLVMFuzzerTestOneInput(const uint8_t *data, size_t size)
         const svac3_frame_t *fr;
         svac3_dec_nal(dec, nal, nal_len, &fr);
     }
+    svac3_dec_flush(dec);
     svac3_dec_destroy(dec);
     return 0;
 }

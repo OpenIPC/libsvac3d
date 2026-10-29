@@ -658,6 +658,8 @@ static void derive_skip_motion(const parser_t *p, int x0, int y0, int w, int h, 
     if (subtype == 0) {
         if (!p->tmvp || !p->refs->col)
             return;
+        if (p->refs->wait_tmv)
+            p->refs->wait_tmv(p->refs->col_ctx, (y0 >> 4) + 1);
         const svac3_tmv_t *t = &p->refs->col[(y0 >> 4) * ((p->pic_w + 15) >> 4) + (x0 >> 4)];
         if (t->ref < 0)
             return;
@@ -677,10 +679,27 @@ static void derive_skip_motion(const parser_t *p, int x0, int y0, int w, int h, 
     }
 }
 
+/* A reference decoded at the same time: wait for the rows that the
+ * interpolation of an h-row block at y0 with vertical motion mvy reads,
+ * the 8-tap luma one and the 4-tap chroma one */
+static void ref_wait(const parser_t *p, int ref, int y0, int h, int mvy)
+{
+    if (!p->refs->wait)
+        return;
+    const int luma = (((y0 << 2) + mvy) >> 2) + h + 4;
+    const int chroma = 2 * (((((y0 >> 1) * 2 << 2) + mvy) >> 3) + h / 2 + 2);
+    int need = luma > chroma ? luma : chroma;
+    if (need > p->pic_h)
+        need = p->pic_h;
+    if (need > 0)
+        p->refs->wait(p->refs->ctx[ref], need);
+}
+
 static void recon_inter(parser_t *p, int x0, int y0, int w, int h, int ref, const int mv[2],
                         int qp, int ctp, int chroma)
 {
     const svac3_frame_t *rf = p->refs->ref[ref];
+    ref_wait(p, ref, y0, h, mv[1]);
     svac3_mc_luma(rf, x0, y0, w, h, mv[0], mv[1], p->pred);
     const int16_t *res = NULL;
     if (ctp & 1) {
@@ -714,9 +733,11 @@ static void recon_chroma_inter(parser_t *p, int x0, int y0, int w, int h, int qp
             for (int x = 0; x < K; x += 2) {
                 const scu_t *s = scu_at(p, x0 + 2 * x, y0 + 2 * y);
                 uint8_t blk[4] = { 128, 128, 128, 128 };
-                if (s && s->ref >= 0)
+                if (s && s->ref >= 0) {
+                    ref_wait(p, s->ref, y0 + 2 * y, 4, s->mv[1]);
                     svac3_mc_chroma(p->refs->ref[s->ref], c, x0 / 2 + x, y0 / 2 + y, 2, 2,
                                     s->mv[0], s->mv[1], blk);
+                }
                 for (int j = 0; j < 2; j++)
                     for (int i = 0; i < 2; i++)
                         p->pred[(y + j) * K + x + i] = blk[j * 2 + i];
@@ -1182,10 +1203,10 @@ size_t svac3_tmv_count(int pic_w, int pic_h)
 /* 5.4.6.7.10.3 with EtmvpMvapEnableFlag, SbTmvpEnableFlag,
  * MvpRefLayerEnableFlag and AwpEnableFlag 0: the motion at the centre of
  * each 16x16 unit */
-static void store_tmv(const parser_t *p, svac3_tmv_t *t)
+static void store_tmv_rows(const parser_t *p, svac3_tmv_t *t, int ty0, int ty1)
 {
-    const int tw = (p->pic_w + 15) >> 4, th = (p->pic_h + 15) >> 4;
-    for (int ty = 0; ty < th; ty++)
+    const int tw = (p->pic_w + 15) >> 4;
+    for (int ty = ty0; ty < ty1; ty++)
         for (int tx = 0; tx < tw; tx++) {
             const int x0 = tx << 4, y0 = ty << 4;
             const int nw = x0 + 16 >= p->pic_w ? p->pic_w - x0 : 16;
@@ -1202,6 +1223,7 @@ static void store_tmv(const parser_t *p, svac3_tmv_t *t)
             }
         }
 }
+
 
 int svac3_patch_supported(const svac3_hls_t *hls)
 {
@@ -1320,6 +1342,9 @@ struct svac3_picture {
      * rows it reads; with patches narrower than the picture, at the end */
     int wavefront;
     int dbk_off, sao_on;
+    svac3_progress_fn progress;
+    void *progress_ctx;
+    int tmv_rows;                /* rows of temporal motion stored */
     /* with 3 threads or more, the filters have a thread of their own */
     int filter_threaded, filter_ending, rows_ready;
     pthread_t filter;
@@ -1341,6 +1366,27 @@ struct svac3_picture {
     coef_chunk_t *coef_spare;
     size_t scu_n, sao_n;
 };
+
+/* Tell the progress callback which rows are final: those no filter step
+ * still to come can change. SAO of LCU row k leaves luma rows above y1 - 4
+ * final (y1 the next band's first row) and chroma rows above y1 / 2 - 4;
+ * deblocking alone, y1 - 3 and y1 / 2 - 3; in luma rows that is y1 - 8
+ * and y1 - 6 for every plane. */
+static void report(svac3_picture_t *pic)
+{
+    if (!pic->progress)
+        return;
+    const parser_t *r = &pic->r;
+    const int L = r->lcu_size;
+    int rows;
+    if (pic->sao_on)
+        rows = pic->sao_done >= r->lcu_h ? r->pic_h : pic->sao_done * L - 8;
+    else if (!pic->dbk_off)
+        rows = pic->dbk_done >= r->lcu_h ? r->pic_h : pic->dbk_done * L - 6;
+    else
+        rows = pic->dbk_done >= r->lcu_h ? r->pic_h : pic->dbk_done * L;
+    pic->progress(pic->progress_ctx, rows < 0 ? 0 : rows, -1);
+}
 
 /* The deblocking parameters of LCU row k's units */
 static void fill_units(svac3_picture_t *pic, int k)
@@ -1380,8 +1426,10 @@ static void filter_upto(svac3_picture_t *pic, int rows, int final)
         }
         pic->dbk_done = dbk_to;
     }
-    if (!pic->sao_on || pic->sao_done >= pic->dbk_done)
+    if (!pic->sao_on || pic->sao_done >= pic->dbk_done) {
+        report(pic);
         return;
+    }
     /* the deblocked rows the SAO of LCU rows sao_done .. dbk_done - 1 reads
      * that are final now: up to 4 above the next band (whose top edge
      * changes the 3 above it) */
@@ -1401,6 +1449,7 @@ static void filter_upto(svac3_picture_t *pic, int rows, int final)
     svac3_sao_rows(r->frame, pic->sao_src, (const svac3_sao_t (*)[3])r->sao, L, r->lcu_w, lh,
                    pic->sao_done, pic->dbk_done, r->pool);
     pic->sao_done = pic->dbk_done;
+    report(pic);
 }
 
 /* The reconstruction has finished LCU rows 0 .. rows - 1 */
@@ -1408,6 +1457,18 @@ static void filter_rows_done(svac3_picture_t *pic, int rows)
 {
     if (!pic || !pic->wavefront)
         return;
+    /* the temporal motion of the rows: a later picture may be waiting */
+    if (pic->progress && pic->p.tmv_out) {
+        const parser_t *r = &pic->r;
+        int ty1 = rows * r->lcu_size / 16;
+        if (ty1 > (r->pic_h + 15) >> 4)
+            ty1 = (r->pic_h + 15) >> 4;
+        if (ty1 > pic->tmv_rows) {
+            store_tmv_rows(r, pic->p.tmv_out, pic->tmv_rows, ty1);
+            pic->tmv_rows = ty1;
+            pic->progress(pic->progress_ctx, -1, ty1);
+        }
+    }
     if (!pic->filter_threaded) {
         filter_upto(pic, rows, 0);
         return;
@@ -1959,6 +2020,12 @@ static int decode_patch(parser_t *p, const svac3_hls_t *hls, const uint8_t *data
     return SVAC3_OK;
 }
 
+void svac3_picture_set_progress(svac3_picture_t *pic, svac3_progress_fn fn, void *ctx)
+{
+    pic->progress = fn;
+    pic->progress_ctx = ctx;
+}
+
 void svac3_picture_set_pool(svac3_picture_t *pic, svac3_pool_t *pool)
 {
     pic->p.pool = pic->r.pool = pool;
@@ -2026,8 +2093,10 @@ int svac3_picture_end_cached(svac3_picture_t *pic, const svac3_hls_t *hls,
         ret = SVAC3_ERR_NOMEM;
     else if (p->recon)
         filter_upto(pic, 0, 1);                 /* what the rows left to filter */
-    if (ret == SVAC3_OK && p->tmv_out)
-        store_tmv(p->recon ? &pic->r : p, p->tmv_out);
+    if (ret == SVAC3_OK && p->tmv_out)          /* the rows not stored yet */
+        store_tmv_rows(p->recon ? &pic->r : p, p->tmv_out, pic->tmv_rows, (p->pic_h + 15) >> 4);
+    if (pic->progress)                          /* all of it, even in error */
+        pic->progress(pic->progress_ctx, p->pic_h, (p->pic_h + 15) >> 4);
     svac3_picture_release(pic, cache);
     return ret;
 }

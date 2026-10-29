@@ -42,14 +42,16 @@ jobs:
           cmake -S . -B build -DCMAKE_BUILD_TYPE=RelWithDebInfo -DCMAKE_C_COMPILER=clang \
             -DCMAKE_C_FLAGS="-fsanitize=thread -g"
           cmake --build build -j"$(nproc)"
-      - name: Decode every stream on 4 threads
+      - name: Decode every stream on 2 and 4 threads
         env:
           TSAN_OPTIONS: halt_on_error=1
         run: |
           for s in tests/streams/*.svac3; do
+            build/svac3dec -t 2 "$s" /dev/null
             build/svac3dec -t 4 "$s" /dev/null
           done
           build/test_api tests/streams/cv608_synth_1080p_cbr2m.svac3
+          build/test_api -lost tests/streams/cv608_patch4_1080p.svac3
 
   fuzz:
     runs-on: ubuntu-24.04
@@ -64,6 +66,11 @@ jobs:
             source/svac3/svac3_inter.c source/svac3/svac3_dec.c source/svac3/svac3_dsp.c \
             source/svac3/svac3_pool.c -lpthread \
             -o fuzz_patch
+          clang $F -DFUZZ_THREADS=3 tests/fuzz/fuzz_patch.c source/svac3/svac3_hls.c \
+            source/svac3/svac3_aec.c source/svac3/svac3_patch.c source/svac3/svac3_recon.c \
+            source/svac3/svac3_loopfilter.c source/svac3/svac3_inter.c source/svac3/svac3_dec.c \
+            source/svac3/svac3_dsp.c source/svac3/svac3_pool.c -lpthread \
+            -o fuzz_frames
       - name: Fuzz the header parser for 60 s
         run: |
           mkdir -p corpus
@@ -76,6 +83,11 @@ jobs:
           head -c 60000 tests/streams/cv608_smartp_1080p.svac3 > corpus_patch/library.svac3
           head -c 60000 tests/streams/cv608_patch4_1080p.svac3 > corpus_patch/patches.svac3
           ./fuzz_patch -max_total_time=60 -max_len=65536 corpus_patch
+      - name: Fuzz the picture threads for 60 s
+        run: |
+          mkdir -p corpus_frames
+          cp corpus_patch/*.svac3 corpus_frames/
+          ./fuzz_frames -max_total_time=60 -max_len=65536 corpus_frames
 
   ffmpeg:
     runs-on: ubuntu-24.04
