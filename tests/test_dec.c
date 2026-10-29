@@ -5,6 +5,7 @@
  * usage: test_dec <stream.svac3>   (a stream from tests/streams: SPS, PPS,
  *        an IDR picture, then P pictures each referencing the one before)
  *        test_dec -library <stream.svac3>   (a stream with library pictures)
+ *        test_dec -patches <stream.svac3>   (a stream of several patches per picture)
  */
 #include <stdint.h>
 #include <stdio.h>
@@ -94,11 +95,73 @@ static void library_checks(const unit_t *u, int n)
     svac3_dec_destroy(d);
 }
 
+/* A stream of several patches per picture: all of it decodes; a picture
+ * missing a patch is dropped, and the unit that shows the loss says so. */
+static void patch_checks(const unit_t *u, int n)
+{
+    /* each patch unit's patch_index, from a header parse of its own */
+    static svac3_hls_t h;
+    int pictures = 0, second = -1, p1 = -1, last0 = -1, npatch0 = 0, ph2 = -1;
+    memset(&h, 0, sizeof(h));
+    for (int i = 0; i < n; i++) {
+        if (svac3_parse_nal(&h, u[i].p, u[i].len, 0, NULL) || !u[i].patch)
+            continue;
+        if (h.patch.patch_index == 0 && ++pictures == 2 && second < 0)
+            second = i;
+        if (pictures == 1) {
+            npatch0++;
+            last0 = i;
+            if (h.patch.patch_index == 1)
+                p1 = i;
+        }
+    }
+    for (int i = last0 + 1; i < second; i++)
+        if ((u[i].p[1] & 31u) == SVAC3_NAL_PIC_HEAD)
+            ph2 = i;
+    CHECK(npatch0 > 2 && p1 > 0 && second > last0 && ph2 > last0);
+    if (npatch0 <= 2 || p1 < 0 || ph2 < 0)
+        return;
+
+    svac3_dec_t *d = svac3_dec_create();
+    int pics = 0;
+    CHECK(feed(d, u, 0, n, &pics) == 0 && pics == pictures);
+
+    /* without its second patch, the first picture is not output: each
+     * later patch of it is out of order or has no picture to go to */
+    svac3_dec_reset(d);
+    int errors = 0, out = 0;
+    for (int i = 0; i < second; i++) {
+        const svac3_frame_t *f;
+        if (i == p1)
+            continue;
+        errors += svac3_dec_nal(d, u[i].p, u[i].len, &f) == SVAC3_ERR_CORRUPT;
+        out += f != NULL;
+    }
+    CHECK(errors == npatch0 - 2 && out == 0);
+
+    /* without its last patch, the next picture header ends it */
+    svac3_dec_reset(d);
+    errors = out = 0;
+    for (int i = 0; i <= ph2; i++) {
+        const svac3_frame_t *f;
+        if (i == last0)
+            continue;
+        const int r = svac3_dec_nal(d, u[i].p, u[i].len, &f);
+        errors += r != 0;
+        out += f != NULL;
+        if (r)
+            CHECK(r == SVAC3_ERR_CORRUPT && i == ph2);
+    }
+    CHECK(errors == 1 && out == 0);
+    svac3_dec_destroy(d);
+}
+
 int main(int argc, char **argv)
 {
     const int library = argc == 3 && !strcmp(argv[1], "-library");
-    if (argc != 2 && !library) {
-        fprintf(stderr, "usage: %s [-library] stream.svac3\n", argv[0]);
+    const int patches = argc == 3 && !strcmp(argv[1], "-patches");
+    if (argc != 2 && !library && !patches) {
+        fprintf(stderr, "usage: %s [-library|-patches] stream.svac3\n", argv[0]);
         return 2;
     }
     size_t len;
@@ -113,8 +176,11 @@ int main(int argc, char **argv)
         if (nal_len >= 2)
             u[n++] = (unit_t){ nal, nal_len, svac3_nal_is_patch(nal[1] & 31u) };
 
-    if (library) {
-        library_checks(u, n);
+    if (library || patches) {
+        if (library)
+            library_checks(u, n);
+        else
+            patch_checks(u, n);
         free(u);
         free(buf);
         if (failures)

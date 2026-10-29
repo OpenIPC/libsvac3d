@@ -51,10 +51,83 @@ static void out(void *opaque, const svac3d_picture_t *pic)
     s->last_poi = pic->poi;
 }
 
+/* A stream of several patches per picture, with the first picture's last
+ * patch removed, in one buffer: the call reports the loss and still gives
+ * every picture the units complete, as the internal decoder fed the same
+ * units one by one, carrying on past errors, does. */
+static void lost_patch_checks(const uint8_t *buf, size_t len)
+{
+    size_t pos = 0, nal_len, cut0 = 0, cut1 = 0;
+    const uint8_t *nal;
+    int pictures = 0;
+    static svac3_hls_t h;
+    memset(&h, 0, sizeof(h));
+    while (svac3_next_nal(buf, len, &pos, &nal, &nal_len)) {
+        if (nal_len < 2 || svac3_parse_nal(&h, nal, nal_len, 0, NULL))
+            continue;
+        if (!svac3_nal_is_patch(nal[1] & 31u))
+            continue;
+        if (h.patch.patch_index == 0)
+            pictures++;
+        if (pictures == 1) {             /* remember the last patch of picture 0 */
+            cut0 = (size_t)(nal - buf) - 3;
+            cut1 = pos;
+        }
+    }
+    CHECK(pictures > 2 && cut1 > cut0);
+    uint8_t *lost = malloc(len);
+    if (!lost)
+        return;
+    memcpy(lost, buf, cut0);
+    memcpy(lost + cut0, buf + cut1, len - cut1);
+    const size_t lost_len = len - (cut1 - cut0);
+
+    sink_t want = { 0xcbf29ce484222325ULL, 0, 0, 0 };
+    {
+        svac3_dec_t *d = svac3_dec_create();
+        pos = 0;
+        while (svac3_next_nal(lost, lost_len, &pos, &nal, &nal_len)) {
+            const svac3_frame_t *f;
+            if (!nal_len)
+                continue;
+            svac3_dec_nal(d, nal, nal_len, &f);
+            if (!f)
+                continue;
+            const svac3_sps_t *s = &svac3_dec_hls(d)->sps;
+            svac3d_picture_t pic = { .width = s->horizontal_size, .height = s->vertical_size };
+            for (int c = 0; c < 3; c++) {
+                pic.data[c] = f->plane[c];
+                pic.linesize[c] = f->stride[c];
+            }
+            out(&want, &pic);
+        }
+        svac3_dec_destroy(d);
+    }
+    svac3d_t *d = svac3d_open();
+    sink_t got = { 0xcbf29ce484222325ULL, 0, 0, 0 };
+    CHECK(svac3d_decode(d, lost, lost_len, out, &got) == SVAC3D_ERR_CORRUPT);
+    CHECK(got.pics > 0 && got.pics < pictures && got.pics == want.pics && got.hash == want.hash);
+    svac3d_close(d);
+    free(lost);
+}
+
 int main(int argc, char **argv)
 {
+    if (argc == 3 && !strcmp(argv[1], "-lost")) {
+        size_t len;
+        uint8_t *buf = read_file(argv[2], &len);
+        if (!buf)
+            return 1;
+        lost_patch_checks(buf, len);
+        free(buf);
+        if (failures)
+            fprintf(stderr, "%d check(s) failed\n", failures);
+        else
+            printf("all checks passed\n");
+        return failures ? 1 : 0;
+    }
     if (argc != 2) {
-        fprintf(stderr, "usage: %s stream.svac3\n", argv[0]);
+        fprintf(stderr, "usage: %s [-lost] stream.svac3\n", argv[0]);
         return 2;
     }
     size_t len;

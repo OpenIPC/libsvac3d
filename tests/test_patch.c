@@ -69,11 +69,29 @@ int main(int argc, char **argv)
     CHECK(svac3_patch_parse(t, rbsp, rl, &st) == SVAC3_ERR_INVALID);
 
     /* huge patch dimensions are compared without overflow and still accepted
-     * as covering the picture; small ones mean several patches */
+     * as covering the picture */
     *t = *hls; t->sps.patch_width_minus1 = 0x7fffffff; t->sps.patch_height_minus1 = 0xffffffffu;
-    CHECK(svac3_patch_parse(t, rbsp, rl, &st) == SVAC3_OK);
+    CHECK(svac3_patch_parse(t, rbsp, rl, &st) == SVAC3_OK && st.stuffing_ok);
+    CHECK(svac3_picture_patches(t) == 1);
+    /* small ones mean several patches: this patch's data then fills the
+     * first, one LCU wide, and does not end there */
     *t = *hls; t->sps.patch_width_minus1 = 0;
+    CHECK(svac3_picture_patches(t) == 60 && svac3_patch_supported(t) == SVAC3_OK);
+    CHECK(svac3_patch_parse(t, rbsp, rl, &st) == SVAC3_OK && !st.stuffing_ok && st.lcus == 34);
+    /* the single-patch call refuses them; svac3_picture_*() decodes them */
+    {
+        uint8_t one = 0;
+        svac3_frame_t none = { .plane = { &one, &one, &one } };
+        CHECK(svac3_patch_decode(t, rbsp, rl, &none, NULL, NULL, &st) == SVAC3_ERR_UNSUPPORTED);
+    }
+    /* a patch_index past the picture's patches */
+    t->patch.patch_index = 60;
+    CHECK(svac3_patch_parse(t, rbsp, rl, &st) == SVAC3_ERR_INVALID);
+    /* several patches whose loop filters stop at patch boundaries */
+    *t = *hls; t->sps.patch_width_minus1 = 0; t->sps.cross_patch_loop_filter_enable_flag = 0;
     CHECK(svac3_patch_parse(t, rbsp, rl, &st) == SVAC3_ERR_UNSUPPORTED);
+    *t = *hls; t->sps.cross_patch_loop_filter_enable_flag = 0;
+    CHECK(svac3_patch_parse(t, rbsp, rl, &st) == SVAC3_OK);   /* one patch: nothing to stop at */
 
     /* patch kinds other than display-picture patches */
     *t = *hls; t->patch.nal_unit_type = SVAC3_NAL_CRR_PRIVACY;

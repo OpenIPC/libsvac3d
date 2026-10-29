@@ -31,7 +31,9 @@ typedef struct {
 /* Returns SVAC3_OK if the SPS/PPS/PH use only tools this parser handles. */
 int svac3_patch_supported(const svac3_hls_t *hls);
 
-/* Parse the patch whose header is hls->patch. data/len is the patch RBSP
+/* Parse the patch whose header is hls->patch, of any patch_index (a
+ * neighbour in another patch is unavailable, so a patch parses alone).
+ * data/len is the patch RBSP
  * (after emulation prevention removal); the AEC data starts at
  * hls->patch.aec_data_offset. */
 int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
@@ -57,7 +59,8 @@ typedef struct {
 /* Number of svac3_tmv_t a picture of this size stores. */
 size_t svac3_tmv_count(int pic_w, int pic_h);
 
-/* As svac3_patch_parse(), and also reconstruct the patch into frame,
+/* For a picture that is a single patch: as svac3_patch_parse(), and also
+ * reconstruct it into frame,
  * including deblocking and SAO. frame must hold the coded picture in 4:2:0
  * (SVAC3_ERR_INVALID otherwise). A P picture needs refs, with at least
  * NumRefActive[0] pictures of the same size, each with its temporal motion
@@ -69,5 +72,32 @@ size_t svac3_tmv_count(int pic_w, int pic_h);
 int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
                        svac3_frame_t *frame, const svac3_refs_t *refs, svac3_tmv_t *tmv,
                        svac3_patch_stats_t *stats);
+
+/* A picture of several patches, decoded one patch at a time:
+ * svac3_picture_begin() with the parameter sets and picture header in hls
+ * (and frame, refs and tmv as for svac3_patch_decode()), then
+ * svac3_picture_patch() for each patch in patch_index order, then
+ * svac3_picture_end(), which runs the loop filters over the whole picture,
+ * stores its temporal motion and frees it. hls must stay the same object
+ * throughout, with only its patch header changing. */
+typedef struct svac3_picture svac3_picture_t;
+
+/* Number of patches in a picture with this SPS (uniform patches), or -1 */
+int svac3_picture_patches(const svac3_hls_t *hls);
+
+int svac3_picture_begin(const svac3_hls_t *hls, svac3_frame_t *frame, const svac3_refs_t *refs,
+                        svac3_tmv_t *tmv, svac3_picture_t **pic);
+
+/* Decode the patch whose header is hls->patch. Returns 1 when it was the
+ * picture's last patch, 0 when more are due, SVAC3_ERR_CORRUPT for a patch
+ * out of order or not ending on its last LCU. */
+int svac3_picture_patch(svac3_picture_t *pic, const svac3_hls_t *hls, const uint8_t *data,
+                        size_t len, svac3_patch_stats_t *stats);
+
+/* Finish and free the picture: SVAC3_ERR_CORRUPT if patches are missing. */
+int svac3_picture_end(svac3_picture_t *pic, const svac3_hls_t *hls);
+
+/* Free a picture without finishing it. */
+void svac3_picture_free(svac3_picture_t *pic);
 
 #endif /* SVAC3_PATCH_H */

@@ -5,7 +5,7 @@
  * draft of GB/T SVAC 3.0 (national standard plan 20243294-T-312).
  *
  * Supported: the Main profile (0x30) tool set HiSilicon encoders use,
- * 8-bit 4:2:0, I and P pictures, one patch per picture, and displayed
+ * 8-bit 4:2:0, I and P pictures in one or several uniform patches, and displayed
  * library pictures with the pictures that reference them. Pictures come out
  * in decoding order, which for these low-delay streams is display order.
  * Anything else is refused with SVAC3D_ERR_UNSUPPORTED.
@@ -68,9 +68,11 @@ void svac3d_reset(svac3d_t *d);
 
 /* Decode an Annex-B buffer (start codes, then NAL units) holding any whole
  * number of NAL units, typically one access unit. out is called once for
- * each picture completed, before the call returns. Decoding stops at the
- * first NAL unit in error, whose code is returned; the decoder stays usable
- * and later buffers decode normally once their references exist. */
+ * each picture completed, before the call returns. A NAL unit in error
+ * does not stop the others: the first error is returned once the whole
+ * buffer is decoded, and every picture that did complete has been given
+ * to out. The decoder stays usable; pictures referencing a lost one are
+ * refused until the next I picture. */
 int svac3d_decode(svac3d_t *d, const uint8_t *buf, size_t len, svac3d_output_fn out,
                   void *opaque);
 

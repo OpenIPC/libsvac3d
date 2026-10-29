@@ -63,6 +63,7 @@ typedef struct {
     uint8_t ipm;             /* IntraLumaPredMode, when intra */
     uint8_t qp;              /* QPY of the coding unit */
     uint8_t cbf;             /* the coding unit has coefficients */
+    uint8_t patch;           /* patch_index of the patch it was decoded in */
     int8_t ref;              /* L0 reference index, -1 when intra */
     int16_t mv[2];           /* L0 motion vector */
     uint32_t cu_id;          /* which coding unit, for the deblocking filter */
@@ -86,6 +87,11 @@ typedef struct {
 
     int scu_stride;
     scu_t *scu;
+
+    /* the patch being decoded, in LCUs: [plx0, plx1) x [ply0, ply1) */
+    int cur_patch, plx0, plx1, ply0, ply1;
+    int num_patches, next_patch;   /* patches the picture has, and the one due */
+    svac3_tmv_t *tmv_out;
 
     /* scratch for one transform block */
     int16_t order[64 * 64];
@@ -151,12 +157,21 @@ static int byp_tu(parser_t *p, int max)
     return v;
 }
 
-static const scu_t *scu_at(const parser_t *p, int x, int y)
+/* The decoded unit at (x, y) of any patch */
+static const scu_t *scu_any(const parser_t *p, int x, int y)
 {
     if (x < 0 || y < 0 || x >= p->pic_w || y >= p->pic_h)
         return NULL;
     const scu_t *s = &p->scu[(y >> 2) * p->scu_stride + (x >> 2)];
     return s->coded ? s : NULL;
+}
+
+/* The unit at (x, y) if it is available: decoded, and in the current
+ * patch, since a neighbour in another patch is not available */
+static const scu_t *scu_at(const parser_t *p, int x, int y)
+{
+    const scu_t *s = scu_any(p, x, y);
+    return s && s->patch == p->cur_patch ? s : NULL;
 }
 
 static void scu_mark(parser_t *p, int x0, int y0, int w, int h, int skip, int intra)
@@ -170,6 +185,7 @@ static void scu_mark(parser_t *p, int x0, int y0, int w, int h, int skip, int in
             s->skip = (uint8_t)skip;
             s->intra = (uint8_t)intra;
             s->cu_id = p->next_cu_id;
+            s->patch = (uint8_t)p->cur_patch;
         }
     p->next_cu_id++;
 }
@@ -180,7 +196,8 @@ static void scu_mark(parser_t *p, int x0, int y0, int w, int h, int skip, int in
 static void parse_sao(parser_t *p, int lcu_x, int lcu_y, const uint8_t sao_en[3],
                       svac3_sao_t out[3])
 {
-    const int left = lcu_x > 0, up = lcu_y > 0;
+    /* merge candidates are LCUs of the same patch */
+    const int left = lcu_x > p->plx0, up = lcu_y > p->ply0;
     int merge = 0;
 
     memset(out, 0, sizeof(svac3_sao_t) * 3);
@@ -1126,7 +1143,7 @@ static void store_tmv(const parser_t *p, svac3_tmv_t *t)
             const int x0 = tx << 4, y0 = ty << 4;
             const int nw = x0 + 16 >= p->pic_w ? p->pic_w - x0 : 16;
             const int nh = y0 + 16 >= p->pic_h ? p->pic_h - y0 : 16;
-            const scu_t *s = scu_at(p, x0 + nw / 2, y0 + nh / 2);
+            const scu_t *s = scu_any(p, x0 + nw / 2, y0 + nh / 2);
             svac3_tmv_t *o = &t[ty * tw + tx];
             memset(o, 0, sizeof(*o));
             o->ref = -1;
@@ -1181,6 +1198,10 @@ int svac3_patch_supported(const svac3_hls_t *hls)
         return SVAC3_ERR_UNSUPPORTED;       /* run-level coefficients not written yet */
     if (!s->stable_patch_flag || !s->uniform_patch_flag)
         return SVAC3_ERR_UNSUPPORTED;
+    /* loop filters stopping at patch boundaries are not written: several
+     * patches need cross_patch_loop_filter_enable_flag */
+    if (!s->cross_patch_loop_filter_enable_flag && svac3_picture_patches(hls) != 1)
+        return SVAC3_ERR_UNSUPPORTED;
     /* picture_qp and patch_qp are 0..63 for 8-bit video (7-bit fields) */
     if (hls->ph.picture_qp > 63 || (!hls->pps.fixed_picture_qp_flag && hls->patch.patch_qp > 63))
         return SVAC3_ERR_INVALID;
@@ -1197,12 +1218,6 @@ int svac3_patch_supported(const svac3_hls_t *hls)
     if (hls->ph.picture_coding_type != 1 && hls->ph.picture_coding_type != 2)
         return SVAC3_ERR_INVALID;           /* 0 is reserved */
     return SVAC3_OK;
-}
-
-int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
-                      svac3_patch_stats_t *st)
-{
-    return svac3_patch_decode(hls, data, len, NULL, NULL, NULL, st);
 }
 
 /* References for a P picture: enough of them, each the size of frame, with
@@ -1223,26 +1238,45 @@ static int refs_ok(const svac3_refs_t *r, int need, const svac3_frame_t *frame, 
     return !tmvp || r->col;
 }
 
-int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
-                       svac3_frame_t *frame, const svac3_refs_t *refs, svac3_tmv_t *tmv,
-                       svac3_patch_stats_t *st)
+struct svac3_picture {
+    parser_t p;
+};
+
+int svac3_picture_patches(const svac3_hls_t *hls)
 {
-    parser_t *p;
+    const svac3_sps_t *s = &hls->sps;
+    const int lcu = 1 << (s->log2_lcu_size_minus2 + 2);
+    const uint64_t lw = ((uint64_t)s->pic_width_in_luma + lcu - 1) / lcu;
+    const uint64_t lh = ((uint64_t)s->pic_height_in_luma + lcu - 1) / lcu;
+    const uint64_t pw = (uint64_t)s->patch_width_minus1 + 1, ph = (uint64_t)s->patch_height_minus1 + 1;
+    const uint64_t n = ((lw + pw - 1) / pw) * ((lh + ph - 1) / ph);
+    return n > 256 ? -1 : (int)n;           /* patch_index is 8 bits */
+}
+
+void svac3_picture_free(svac3_picture_t *pic)
+{
+    if (!pic)
+        return;
+    free(pic->p.sao);
+    free(pic->p.scu);
+    free(pic);
+}
+
+int svac3_picture_begin(const svac3_hls_t *hls, svac3_frame_t *frame, const svac3_refs_t *refs,
+                        svac3_tmv_t *tmv, svac3_picture_t **out)
+{
     int ret = svac3_patch_supported(hls);
 
-    memset(st, 0, sizeof(*st));
+    *out = NULL;
     if (ret)
         return ret;
-    if (hls->patch.aec_data_offset > len)
-        return SVAC3_ERR_INVALID;
-
-    p = calloc(1, sizeof(*p));
-    if (!p)
+    svac3_picture_t *pic = calloc(1, sizeof(*pic));
+    if (!pic)
         return SVAC3_ERR_NOMEM;
+    parser_t *p = &pic->p;
     const svac3_sps_t *s = p->sps = &hls->sps;
     p->pps = &hls->pps;
     p->ph = &hls->ph;
-    p->st = st;
     p->pct = hls->ph.picture_coding_type;
     p->pic_w = s->pic_width_in_luma;
     p->pic_h = s->pic_height_in_luma;
@@ -1255,68 +1289,89 @@ int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
     p->max_eqt = 1 << (s->log2_max_eqt_size_minus3 + 3);
     p->max_part_ratio = 1 << (s->log2_max_part_ratio_minus2 + 2);
     p->max_split = s->max_split_times_minus6 + 6;
-    p->fixed_qp = hls->pps.fixed_picture_qp_flag ? 1 : hls->patch.fixed_patch_qp_flag;
     p->cu_delta_qp_flag = hls->pps.cu_delta_qp_flag;
     p->qp_group_area = 1 << ((hls->pps.cu_qp_group_size_log2_minus3 + 3) * 2);
+    p->num_patches = svac3_picture_patches(hls);
     const uint32_t ref_minus1 = hls->ph.num_ref_active_override_flag
                                 ? hls->ph.num_ref_active_minus1[0]
                                 : s->num_ref_default_active_minus1[0];
-    if (ref_minus1 >= SVAC3_MAX_REFS) {
-        free(p);
-        return SVAC3_ERR_INVALID;
-    }
-    p->num_ref_active0 = (int)ref_minus1 + 1;
-    if (frame && !frame_ok(frame, s->pic_width_in_luma, s->pic_height_in_luma)) {
-        free(p);
-        return SVAC3_ERR_INVALID;
-    }
+    ret = SVAC3_OK;
+    if (p->num_patches < 1)
+        ret = SVAC3_ERR_INVALID;
+    else if (ref_minus1 >= SVAC3_MAX_REFS)
+        ret = SVAC3_ERR_INVALID;
+    else if (frame && !frame_ok(frame, s->pic_width_in_luma, s->pic_height_in_luma))
+        ret = SVAC3_ERR_INVALID;
+    p->num_ref_active0 = ret ? 1 : (int)ref_minus1 + 1;   /* in range once ret is 0 */
     p->tmvp = hls->ph.picture_tmvp_enable_flag;
-    if (frame && p->pct == 2 && !refs_ok(refs, p->num_ref_active0, frame, p->tmvp)) {
-        free(p);
-        return SVAC3_ERR_INVALID;
+    if (!ret && frame && p->pct == 2 && !refs_ok(refs, p->num_ref_active0, frame, p->tmvp))
+        ret = SVAC3_ERR_INVALID;
+    if (ret) {
+        free(pic);
+        return ret;
     }
     p->frame = frame;
     p->refs = p->pct == 2 ? refs : NULL;
     p->recon = frame != NULL;
+    p->tmv_out = tmv;
     p->mipf = s->mipf_enable_flag;
-    p->patch_qp = hls->pps.fixed_picture_qp_flag ? hls->ph.picture_qp : hls->patch.patch_qp;
-    p->prev_cu_qp = p->lcu_qp = p->patch_qp;
     p->cb_delta = hls->ph.chroma_quant_param_disable_flag ? 0 : hls->ph.chroma_quant_param_delta_cb;
     p->cr_delta = hls->ph.chroma_quant_param_disable_flag ? 0 : hls->ph.chroma_quant_param_delta_cr;
     p->scu_stride = (p->pic_w + 3) / 4;
     p->scu = calloc((size_t)p->scu_stride * ((p->pic_h + 3) / 4), sizeof(scu_t));
-    if (!p->scu) {
-        free(p);
+    if (p->scu && p->recon)
+        p->sao = calloc((size_t)p->lcu_w * p->lcu_h, sizeof(*p->sao));
+    if (!p->scu || (p->recon && !p->sao)) {
+        svac3_picture_free(pic);
         return SVAC3_ERR_NOMEM;
     }
+    *out = pic;
+    return SVAC3_OK;
+}
 
-    /* a single patch covering the picture */
-    if ((uint64_t)s->patch_width_minus1 + 1 < (uint64_t)p->lcu_w ||
-        (uint64_t)s->patch_height_minus1 + 1 < (uint64_t)p->lcu_h ||
-        hls->patch.patch_index != 0) {
-        free(p->scu);
-        free(p);
-        return SVAC3_ERR_UNSUPPORTED;       /* several patches per picture */
-    }
+/* Decode the patch whose header is hls->patch into the picture. */
+static int decode_patch(parser_t *p, const svac3_hls_t *hls, const uint8_t *data, size_t len,
+                        svac3_patch_stats_t *st)
+{
+    const svac3_sps_t *s = &hls->sps;
+    const int k = hls->patch.patch_index;
 
-    if (p->recon) {
-        p->sao = calloc((size_t)p->lcu_w * p->lcu_h, sizeof(*p->sao));
-        if (!p->sao) {
-            free(p->scu);
-            free(p);
-            return SVAC3_ERR_NOMEM;
-        }
-    }
+    memset(st, 0, sizeof(*st));
+    if (hls->patch.aec_data_offset > len || k >= p->num_patches)
+        return SVAC3_ERR_INVALID;
+    p->st = st;
+
+    /* uniform patches in raster order (7.2.4) */
+    /* a patch at least as wide (tall) as the picture is one column (row) */
+    const uint64_t pw64 = (uint64_t)s->patch_width_minus1 + 1, ph64 = (uint64_t)s->patch_height_minus1 + 1;
+    const int pw = pw64 > (uint64_t)p->lcu_w ? p->lcu_w : (int)pw64;
+    const int ph = ph64 > (uint64_t)p->lcu_h ? p->lcu_h : (int)ph64;
+    const int cols = (p->lcu_w + pw - 1) / pw;
+    p->cur_patch = k;
+    p->plx0 = (k % cols) * pw;
+    p->ply0 = (k / cols) * ph;
+    p->plx1 = p->plx0 + pw < p->lcu_w ? p->plx0 + pw : p->lcu_w;
+    p->ply1 = p->ply0 + ph < p->lcu_h ? p->ply0 + ph : p->lcu_h;
+
+    p->fixed_qp = hls->pps.fixed_picture_qp_flag ? 1 : hls->patch.fixed_patch_qp_flag;
+    p->patch_qp = hls->pps.fixed_picture_qp_flag ? hls->ph.picture_qp : hls->patch.patch_qp;
+    p->prev_cu_qp = p->lcu_qp = p->patch_qp;
+    /* a QP group does not continue into the next patch */
+    p->num_delta_qp = 0;
+    p->qp_group_x = p->plx0 * p->lcu_size;
+    p->qp_group_y = p->ply0 * p->lcu_size;
     svac3_ctx_init(p->ctx, SVAC3_NUM_CTX);
     svac3_aec_init(&p->aec, data + hls->patch.aec_data_offset,
                    len - hls->patch.aec_data_offset, s->maec_enable_flag, p->pct);
     st->bytes_avail = len - hls->patch.aec_data_offset;
     st->stuffing_ok = 1;
 
-    const int n_lcu = p->lcu_w * p->lcu_h;
+    const int pcols = p->plx1 - p->plx0;
+    const int n_lcu = pcols * (p->ply1 - p->ply0);
     int prev_dqp = 0;
-    for (int l = 0; l < n_lcu; l++) {
-        const int lx = l % p->lcu_w, ly = l / p->lcu_w;
+    for (int i = 0; i < n_lcu; i++) {
+        const int lx = p->plx0 + i % pcols, ly = p->ply0 + i / pcols;
+        const int l = ly * p->lcu_w + lx;
         if (!p->fixed_qp && !p->cu_delta_qp_flag) {
             /* lcu_qp_delta: unary, 5.3.3.3.2.2 / 5.3.3.4.5 */
             int b = 0, sym = 0;
@@ -1339,7 +1394,7 @@ int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
                          1, PRED_NO_CONSTRAINT);
         const int stuff = svac3_aec_stuffing_bit(&p->aec);
         st->lcus++;
-        if (stuff != (l == n_lcu - 1)) {
+        if (stuff != (i == n_lcu - 1)) {
             if (st->stuffing_ok)
                 st->first_bad_lcu = (unsigned)l;
             st->stuffing_ok = 0;
@@ -1354,19 +1409,75 @@ int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
     }
     st->bytes_used = svac3_aec_bytes_read(&p->aec);
     st->overrun_bits = p->aec.overrun;
+    return SVAC3_OK;
+}
 
-    ret = SVAC3_OK;
-    if (p->frame) {
-        /* a picture that did not parse to its exact end is not a picture */
-        if (!st->stuffing_ok || st->overrun_bits)
-            ret = SVAC3_ERR_CORRUPT;
-        else
-            ret = loop_filters(p, hls);
-        if (ret == SVAC3_OK && tmv)
-            store_tmv(p, tmv);
-    }
-    free(p->sao);
-    free(p->scu);
-    free(p);
+int svac3_picture_patch(svac3_picture_t *pic, const svac3_hls_t *hls, const uint8_t *data,
+                        size_t len, svac3_patch_stats_t *st)
+{
+    parser_t *p = &pic->p;
+    int ret = svac3_patch_supported(hls);
+
+    memset(st, 0, sizeof(*st));
+    if (ret)
+        return ret;
+    if (hls->patch.patch_index != p->next_patch)
+        return SVAC3_ERR_CORRUPT;               /* a patch lost or out of order */
+    ret = decode_patch(p, hls, data, len, st);
+    if (ret)
+        return ret;
+    /* a patch that did not parse to its exact end is not a patch */
+    if (!st->stuffing_ok || st->overrun_bits)
+        return SVAC3_ERR_CORRUPT;
+    p->next_patch++;
+    return p->next_patch == p->num_patches ? 1 : 0;
+}
+
+int svac3_picture_end(svac3_picture_t *pic, const svac3_hls_t *hls)
+{
+    parser_t *p = &pic->p;
+    int ret = SVAC3_OK;
+
+    if (p->next_patch != p->num_patches)
+        ret = SVAC3_ERR_CORRUPT;                /* patches missing */
+    else if (p->recon)
+        ret = loop_filters(p, hls);
+    if (ret == SVAC3_OK && p->tmv_out)
+        store_tmv(p, p->tmv_out);
+    svac3_picture_free(pic);
     return ret;
+}
+
+int svac3_patch_parse(const svac3_hls_t *hls, const uint8_t *data, size_t len,
+                      svac3_patch_stats_t *st)
+{
+    svac3_picture_t *pic;
+    int ret;
+
+    memset(st, 0, sizeof(*st));
+    if ((ret = svac3_picture_begin(hls, NULL, NULL, NULL, &pic)))
+        return ret;
+    ret = decode_patch(&pic->p, hls, data, len, st);
+    svac3_picture_free(pic);
+    return ret;
+}
+
+int svac3_patch_decode(const svac3_hls_t *hls, const uint8_t *data, size_t len,
+                       svac3_frame_t *frame, const svac3_refs_t *refs, svac3_tmv_t *tmv,
+                       svac3_patch_stats_t *st)
+{
+    svac3_picture_t *pic;
+    int ret;
+
+    memset(st, 0, sizeof(*st));
+    if (svac3_patch_supported(hls) == SVAC3_OK && svac3_picture_patches(hls) != 1)
+        return SVAC3_ERR_UNSUPPORTED;           /* use svac3_picture_*() */
+    if ((ret = svac3_picture_begin(hls, frame, refs, tmv, &pic)))
+        return ret;
+    ret = svac3_picture_patch(pic, hls, data, len, st);
+    if (ret < 0) {
+        svac3_picture_free(pic);
+        return ret;
+    }
+    return svac3_picture_end(pic, hls);
 }

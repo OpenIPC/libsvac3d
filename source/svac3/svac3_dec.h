@@ -25,7 +25,9 @@ void svac3_dec_destroy(svac3_dec_t *d);
  * svac3_dec_hls()->sps), and stays valid until the next call; otherwise
  * *out is NULL. Errors are the SVAC3_ERR_* codes: SVAC3_ERR_CORRUPT also
  * covers a P picture whose reference is not in the buffer, as when
- * decoding starts after the I picture. */
+ * decoding starts after the I picture, and a unit that reveals that an
+ * earlier picture lost a patch. Such a unit is itself decoded, and may
+ * complete a picture: *out is set alongside the error then. */
 int svac3_dec_nal(svac3_dec_t *d, const uint8_t *nal, size_t len, const svac3_frame_t **out);
 
 /* Drop every decoded picture (after a seek); parameter sets are kept */
