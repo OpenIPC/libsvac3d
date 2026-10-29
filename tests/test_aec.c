@@ -74,7 +74,7 @@ int main(int argc, char **argv)
                 break;
             }
             const int kind = (int)(rnd() % 64) < 63 ? (int)(rnd() % 15) : 15, c = (int)(rnd() % NCTX), w = (int)(rnd() % NCTX);
-            int b1, b2;
+            int b1, b2, stuffed = 0;
             if (kind < 10) {
                 b1 = ref_aec_decision(&ra, &rc[c]);
                 b2 = svac3_aec_decision(&fa, &fc[c]);
@@ -88,16 +88,20 @@ int main(int argc, char **argv)
                 /* between LCUs: rarely, so that patches run long */
                 b1 = ref_aec_stuffing_bit(&ra);
                 b2 = svac3_aec_stuffing_bit(&fa);
+                stuffed = 1;
             } else {
                 b1 = ref_bypass_normative(&ra);
                 b2 = svac3_aec_bypass(&fa);
             }
             bins++;
-            ends += kind >= 15 && b1 == 1;
-            const int ctx_same = rc[c].mps == fc[c].mps && rc[c].cycno == fc[c].cycno &&
-                                 rc[c].lgPmps == fc[c].lgPmps && rc[c].lgPmps0 == fc[c].lgPmps0 &&
-                                 rc[c].lgPmps1 == fc[c].lgPmps1;
-            const int end = kind >= 15 && b1 == 1;
+            ends += stuffed && b1 == 1;
+            /* every model, the second of a two-model decision included */
+            int ctx_same = 1;
+            for (int m = 0; m < NCTX; m++)
+                ctx_same &= rc[m].mps == fc[m].mps && rc[m].cycno == fc[m].cycno &&
+                            rc[m].lgPmps == fc[m].lgPmps && rc[m].lgPmps0 == fc[m].lgPmps0 &&
+                            rc[m].lgPmps1 == fc[m].lgPmps1;
+            const int end = stuffed && b1 == 1;
             if (b1 != b2 || !ctx_same || (end && ra.pos != svac3_aec_bits_read(&fa))) {
                 fprintf(stderr, "iteration %d op %d (kind %d): bin %d/%d, bits %zu/%zu, model %s\n",
                         it, op, kind, b1, b2, ra.pos, svac3_aec_bits_read(&fa),
