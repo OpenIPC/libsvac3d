@@ -104,15 +104,19 @@ jobs:
       - name: Fetch FFmpeg and apply the patch
         run: |
           git clone -q --depth 1 --branch "$FFMPEG_TAG" https://github.com/FFmpeg/FFmpeg.git ffmpeg-src
-          git -C ffmpeg-src apply --check "$GITHUB_WORKSPACE"/ffmpeg/0001-*.patch
-          git -C ffmpeg-src apply "$GITHUB_WORKSPACE"/ffmpeg/0001-*.patch
+          # In order, each checked against the tree the previous ones made.
+          for p in "$GITHUB_WORKSPACE"/ffmpeg/0*.patch; do
+            git -C ffmpeg-src apply --check "$p"
+            git -C ffmpeg-src apply "$p"
+          done
       - name: Build a minimal FFmpeg with libsvac3d
         run: |
           mkdir ffbuild && cd ffbuild
           PKG_CONFIG_PATH="$GITHUB_WORKSPACE/prefix/lib/pkgconfig" ../ffmpeg-src/configure \
-            --disable-everything --disable-doc --disable-network --disable-autodetect --disable-x86asm \
+            --disable-everything --disable-doc --disable-autodetect --disable-x86asm \
             --enable-libsvac3d --enable-decoder=libsvac3d --enable-parser=svac3 \
-            --enable-demuxer=svac3 --enable-protocol=file --enable-muxer=framemd5 --enable-encoder=rawvideo \
+            --enable-demuxer=svac3,sdp,rtsp,rtp --enable-protocol=file,udp,rtp,tcp \
+            --enable-muxer=framemd5 --enable-encoder=rawvideo \
             --enable-filter=null,format --extra-cflags=-Werror=implicit-function-declaration
           make -j"$(nproc)" ffmpeg
       - name: framemd5 equals the golden hashes
@@ -123,3 +127,8 @@ jobs:
             ffbuild/ffmpeg -y -hide_banner -loglevel warning -i "$s" -f framemd5 out.framemd5
             python3 ffmpeg/check_framemd5.py "$g" out.framemd5
           done
+      - name: framemd5 over RTP equals the golden hashes
+        run: |
+          ffmpeg/rtp_check.sh ffbuild/ffmpeg
+          # Small packets, so every patch is fragmented.
+          ffmpeg/rtp_check.sh ffbuild/ffmpeg 300

@@ -1,8 +1,10 @@
 # FFmpeg support
 
-`0001-avcodec-add-SVAC-3.0-decoding-via-libsvac3d.patch` adds SVAC 3.0 to
-FFmpeg 9.0 (tag `n9.0.2`). It is written in the shape of the `libuavs3d`
-wrapper:
+Two patches, applied in order to FFmpeg 9.0 (tag `n9.0.2`).
+`0001-avcodec-add-SVAC-3.0-decoding-via-libsvac3d.patch` adds SVAC 3.0
+decoding, in the shape of the `libuavs3d` wrapper.
+`0002-avformat-rtpdec-add-an-RTP-depacketizer-for-SVAC-3.0.patch` adds
+receiving it over RTP and RTSP.
 
 | Piece | Files |
 |---|---|
@@ -10,6 +12,7 @@ wrapper:
 | decoder | `libavcodec/libsvac3d.c`, `--enable-libsvac3d` |
 | parser, one access unit per packet | `libavcodec/svac3_parser.c`, `svac3.h` |
 | raw demuxer, `.svac` / `.svac3` | `libavformat/svac3dec.c` |
+| RTP depacketizer, `SVAC3/90000` | `libavformat/rtpdec_svac3.c` |
 
 ## Build
 
@@ -20,7 +23,7 @@ cmake --build build && cmake --install build
 
 # FFmpeg with the patch
 git clone --depth 1 --branch n9.0.2 https://github.com/FFmpeg/FFmpeg.git
-git -C FFmpeg apply "$PWD"/ffmpeg/0001-*.patch && cd FFmpeg
+for p in ffmpeg/0*.patch; do git -C FFmpeg apply "$PWD/$p"; done && cd FFmpeg
 PKG_CONFIG_PATH=$PWD/../prefix/lib/pkgconfig ./configure --enable-libsvac3d
 make
 ```
@@ -35,7 +38,29 @@ built on libavcodec (mpv, go2rtc's ffmpeg mode) then decode SVAC 3.0.
 ffmpeg/check_framemd5.py tests/golden/cv608_synth_1080p_cbr2m.framemd5 out.framemd5
 ```
 
-CI builds a minimal FFmpeg this way and runs the check on every change.
+`ffmpeg/rtp_check.sh path/to/ffmpeg` sends every corpus stream as RTP over
+local UDP (`ffmpeg/rtp_send.py`), receives it through an SDP, and holds the
+result to the same golden hashes.
+
+CI builds a minimal FFmpeg this way and runs both checks on every change.
+
+## RTP
+
+The SVAC 3.0 draft defines a byte stream and no RTP mapping. The
+depacketizer reads the one OpenIPC cameras send over RTSP, which is RFC
+7798's shape on SVAC3's two-byte NAL header:
+
+- a single NAL unit packet is the NAL unit, header included;
+- a fragmentation unit carries that header with its type replaced by 28,
+  which the draft reserves. An FU header follows (`S|E|R|FuType`, with the
+  5-bit original type), then a fragment of the bytes after the NAL unit's
+  header. The other header fields (security idcs, layer, temporal id) stay
+  as they were;
+- the marker bit ends an access unit;
+- SDP: `a=rtpmap:<pt> SVAC3/90000`, and `sprop-sps` / `sprop-pps` in `fmtp`
+  (base64 of whole NAL units), which become the decoder's extradata.
+
+`ffplay rtsp://camera/stream=0` then plays a camera streaming SVAC 3.0.
 
 ## Notes
 
