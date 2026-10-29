@@ -72,24 +72,30 @@ def pes(data, pts):
     return bytes([0, 0, 1, STREAM_ID]) + (len(hdr) + len(data)).to_bytes(2, "big") + hdr + data
 
 
+def pack(au, n):
+    """Access unit n as its pack: the map ahead of a random access point,
+    then the unit in PES packets, the PTS on the first."""
+    pts = (n * 3000) & 0x1FFFFFFFF
+    types = {nal[1] & 0x1F for nal in au}
+    out = bytearray(pack_header(pts))
+    if types & {2, 4, 7}:
+        out += system_header() + stream_map()
+    data = b"".join(b"\x00\x00\x00\x01" + nal for nal in au)
+    first = True
+    while data or first:
+        room = PES_MAX - (8 if first else 3)
+        out += pes(data[:room], pts if first else None)
+        data = data[room:]
+        first = False
+    return bytes(out)
+
+
 def main():
     src, dst = sys.argv[1], sys.argv[2]
     aus = list(access_units(nal_units(open(src, "rb").read())))
     with open(dst, "wb") as f:
         for n, au in enumerate(aus):
-            pts = (n * 3000) & 0x1FFFFFFFF
-            types = {nal[1] & 0x1F for nal in au}
-            out = bytearray(pack_header(pts))
-            if types & {2, 4, 7}:
-                out += system_header() + stream_map()
-            data = b"".join(b"\x00\x00\x00\x01" + nal for nal in au)
-            first = True
-            while data or first:
-                room = PES_MAX - (8 if first else 3)
-                out += pes(data[:room], pts if first else None)
-                data = data[room:]
-                first = False
-            f.write(out)
+            f.write(pack(au, n))
     print(f"{len(aus)} access units", file=sys.stderr)
 
 

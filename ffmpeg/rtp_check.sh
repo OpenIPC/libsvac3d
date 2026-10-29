@@ -4,7 +4,8 @@
 # raw demuxer is held to: the depacketiser has to give back the stream it was
 # given, byte for byte as far as the decoder can tell.
 #
-# usage: ffmpeg/rtp_check.sh path/to/ffmpeg [mtu [split]]
+# usage: ffmpeg/rtp_check.sh path/to/ffmpeg [mtu [split|ps|ps-nomarker]]
+# (see rtp_send.py: "ps" sends GB/T 28181's program stream, PS/90000)
 set -euo pipefail
 
 ffmpeg=$1
@@ -51,7 +52,7 @@ for g in "$root"/tests/golden/*.framemd5; do
   wait "$ff" || true
   rm -f "$tmp/go" "$tmp/ready"
 
-  echo "$name (mtu $mtu${split:+, $split fmtp}):"
+  echo "$name (mtu $mtu${split:+, $split}):"
   python3 "$here/check_framemd5.py" "$g" "$tmp/out.framemd5"
   port=$((port + 2))
 done

@@ -1,12 +1,14 @@
 # FFmpeg support
 
-Three patches, applied in order to FFmpeg 9.0 (tag `n9.0.2`).
+Four patches, applied in order to FFmpeg 9.0 (tag `n9.0.2`).
 `0001-avcodec-add-SVAC-3.0-decoding-via-libsvac3d.patch` adds SVAC 3.0
 decoding, in the shape of the `libuavs3d` wrapper.
 `0002-avformat-rtpdec-add-an-RTP-depacketizer-for-SVAC-3.0.patch` adds
 receiving it over RTP and RTSP.
 `0003-avformat-mpeg-read-SVAC-video-from-a-GB-T-28181-program-stream.patch`
 reads it from an MPEG-2 program stream, as GB/T 28181 carries it.
+`0004-avformat-rtpdec-add-a-depacketizer-for-GB-T-28181-s-program-stream.patch`
+receives that program stream over RTP and RTSP.
 
 | Piece | Files |
 |---|---|
@@ -16,6 +18,7 @@ reads it from an MPEG-2 program stream, as GB/T 28181 carries it.
 | raw demuxer, `.svac` / `.svac3` | `libavformat/svac3dec.c` |
 | RTP depacketizer, `SVAC3/90000` | `libavformat/rtpdec_svac3.c` |
 | program stream map type 0x80 | `libavformat/mpeg.c`, `mpeg.h` |
+| RTP depacketizer, `PS/90000` | `libavformat/rtpdec_ps.c` |
 
 ## Build
 
@@ -43,7 +46,9 @@ ffmpeg/check_framemd5.py tests/golden/cv608_synth_1080p_cbr2m.framemd5 out.frame
 
 `ffmpeg/rtp_check.sh path/to/ffmpeg` sends every corpus stream as RTP over
 local UDP (`ffmpeg/rtp_send.py`), receives it through an SDP, and holds the
-result to the same golden hashes.
+result to the same golden hashes. With `ps` as its third argument it sends
+the program stream (`PS/90000`) instead, and with `ps-nomarker` the same
+without marker bits.
 
 `ffmpeg/ps_check.sh path/to/ffmpeg` writes every corpus stream as a
 program stream (`ffmpeg/ps_write.py`) and reads it back with `-f mpeg`,
@@ -93,6 +98,16 @@ depacketizer reads the one OpenIPC cameras send over RTSP, which is RFC
 GB/T 28181 carries video as an MPEG-2 program stream, with SVAC named
 `stream_type` 0x80 in the program stream map. That value is user-private in
 ISO/IEC 13818-1, so 0003 reads it as SVAC only on a video stream id
-(0xE0-0xEF). `ffmpeg -f mpeg -i capture.ps` then decodes a capture. RTP
-carrying a program stream (`PS/90000`) has no depacketizer in FFmpeg; save
-the payloads and read the result as a file.
+(0xE0-0xEF). `ffmpeg -f mpeg -i capture.ps` then decodes a capture.
+
+Over RTP the program stream is `a=rtpmap:<pt> PS/90000`, and 0004 reads it,
+so `ffplay "rtsp://camera/stream=0?payload=ps"` plays it. The handler:
+- collects a picture's payloads (one RTP timestamp per picture), and ends
+  the picture at its marker, or when the next picture's first packet
+  arrives without one;
+- reads the picture's packs. The program stream map names the video stream
+  and its codec: SVAC 0x80, H.264 0x1b, H.265 0x24, MPEG-4 0x10, MPEG-1/2
+  0x01/0x02. That stream's PES payloads, joined, are the packet;
+- skips audio and any other stream, since one RTP stream is one AVStream;
+- drops a picture that lost a packet, and what follows until a payload that
+  opens with a pack header.
